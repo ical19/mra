@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         PTM MRA Follow-up System v1.5
+// @name         MRA DASHBOARD OFFLINE DEBUG
 // @namespace    http://tampermonkey.net/
 // @version      1.5
-// @description  Sistem follow-up customer untuk MRA berdasarkan data estimasi PTM - Compact Layout Improved
+// @description  MRA dashboard offline
 // @author       You
 // @match        https://tunastoyota.crm5.dynamics.com/api/data/v9.1/xts_ordertypes?fetchXml=mramanajemen
 // @grant        GM_xmlhttpRequest
@@ -44,7 +44,8 @@
                 sparepart: 0,
                 jasa: 0
             };
-            this.selectedTemplateType = 'formal_ramah';
+            this.selectedTemplateType = 'inti_estimasi';
+            window.app = this;
             this.init();
         }
 
@@ -231,7 +232,7 @@
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
                 <h4 style="margin: 0; color: #333; font-size: 16px; font-weight: 600;">
                     <i class="material-icons" style="vertical-align: middle; margin-right: 8px; color: #1e3c72;">list_alt</i>
-                    Hasil Work Order (${workOrders.length})
+                    Customer Service Record (${workOrders.length} PKB)
                 </h4>
                 <button id="close-workorder-results" class="btn-small" style="display: flex; align-items: center; gap: 4px; padding: 6px 10px; font-size: 12px;">
                     <i class="material-icons" style="font-size: 16px;">close</i>
@@ -248,9 +249,7 @@
                                     ${index + 1}. ${order.xts_workorder || 'N/A'}
                                 </div>
                                 <div style="font-size: 12px; color: #666; margin-top: 4px;">
-                                    ${order.xts_transactiondate ? new Date(order.xts_transactiondate).toLocaleDateString('id-ID') : 'N/A'} |
-                                    Status: ${this.getWorkOrderStatusText(order.xts_workorderstatus)} |
-                                    Total: Rp ${(order.xts_grandtotalamount || 0).toLocaleString('id-ID')}
+                                    ${order.xts_transactiondate ? new Date(order.xts_transactiondate).toLocaleDateString('id-ID') : 'N/A'}  Status PKB: ${order.xts_workorderstatus == 3 ? 'Released' : order.xts_workorderstatus == 4 ? 'Ready To be Invoiced' : order.xts_workorderstatus == 5 ? 'Invoiced' : order.xts_workorderstatus == 122 ? 'Partial Invoiced' : order.xts_workorderstatus == 7 ? 'Finished' : order.xts_workorderstatus == 1 ? 'Open' : 'Unknown' || 'N/A'}
                                 </div>
                             </div>
                             <button class="btn-open-workorder btn-small" style="margin-left: 10px; display: flex; align-items: center; gap: 4px; padding: 6px 10px; font-size: 12px;">
@@ -411,10 +410,10 @@
                     this.showNotification('Data CRM5 ditemukan! Memperbarui...', 'success');
 
                     // Update data estimasi dengan informasi dari CRM5
-                    const changesCount = await this.updateEstimasiFromCRM5(estimasi.id, estimasi, crmData);
+                    const { changesCount, vehicleCache } = await this.updateEstimasiFromCRM5(estimasi.id, estimasi, crmData);
 
-                    // 🔥 TAMPILKAN POPUP HASIL SYNC
-                    this.showSyncResultsPopup(crmData, changesCount);
+                    // Tampilkan popup hasil sync
+                    this.showSyncResultsPopup(crmData, changesCount, vehicleCache);
 
                     // Refresh data
                     await this.loadData();
@@ -437,7 +436,107 @@
             }
         }
 
-        showSyncResultsPopup(crmData, changesCount) {
+        // Method helper untuk membersihkan nomor telepon
+        cleanPhoneNumber(phone) {
+            if (!phone) return '';
+
+            // Hapus semua karakter non-digit
+            let cleaned = phone.toString().replace(/\D/g, '');
+
+            // Handle format Indonesia
+            if (cleaned.startsWith('0')) {
+                cleaned = '62' + cleaned.substring(1);
+            } else if (cleaned.startsWith('8')) {
+                cleaned = '62' + cleaned;
+            }
+
+            return cleaned;
+        }
+
+        // Method helper untuk format nama customer
+        formatCustomerName(name) {
+            if (!name) return '';
+
+            let formattedName = name.toString().trim();
+
+            // Handle format PT/Perusahaan
+            if (formattedName.toUpperCase().startsWith('PT ')) {
+                return formattedName.toUpperCase();
+            }
+
+            // Handle format dengan slash (JOHN/PT MIGAS)
+            if (formattedName.includes('/')) {
+                const parts = formattedName.split('/').map(part => part.trim());
+                const formattedParts = parts.map(part => {
+                    if (part.toUpperCase().startsWith('PT ')) {
+                        return part.toUpperCase(); // PT di-uppercase semua
+                    } else {
+                        // Nama orang - uppercase hanya huruf pertama tiap kata
+                        return part.replace(/\w\S*/g, function(txt) {
+                            return txt.charAt(0).toUpperCase() + txt.substr(1).toLowerCase();
+                        });
+                    }
+                });
+                return formattedParts.join(' / ');
+            }
+
+            // Default: uppercase hanya huruf pertama tiap kata untuk nama orang
+            return formattedName.replace(/\w\S*/g, function(txt) {
+                return txt.charAt(0).toUpperCase() + txt.substr(1).toLowerCase();
+            });
+        }
+
+        // Method untuk mengambil data kendaraan dari CRM5 (CACHE ONLY)
+        async fetchVehicleInfo(nopol) {
+            return new Promise((resolve, reject) => {
+                if (!nopol) {
+                    resolve([]);
+                    return;
+                }
+
+                const fetchXml = `
+            <fetch version="1.0" output-format="xml-platform" mapping="logical" distinct="false">
+                <entity name="xts_vehicleinformation">
+                    <attribute name="xts_vehicleinformationid"/>
+                    <attribute name="xts_platenumber"/>
+                    <attribute name="xts_vehicleidentificationnumber"/>
+                    <attribute name="xts_productdescription"/>
+                    <attribute name="xts_productionyear"/>
+                    <filter type="and">
+                        <condition attribute="statecode" operator="eq" value="0"/>
+                    </filter>
+                    <filter type="or">
+                        <condition attribute="xts_platenumber" operator="like" value="${nopol}%"/>
+                    </filter>
+                </entity>
+            </fetch>
+        `;
+
+                const apiUrl = `https://tunastoyota.crm5.dynamics.com/api/data/v9.0/xts_vehicleinformations?fetchXml=${encodeURIComponent(fetchXml)}`;
+
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url: apiUrl,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json'
+                    },
+                    onload: function(response) {
+                        if (response.status === 200) {
+                            const data = JSON.parse(response.responseText);
+                            resolve(data.value || []);
+                        } else {
+                            reject(new Error(`Vehicle API error: ${response.status}`));
+                        }
+                    },
+                    onerror: function(error) {
+                        reject(error);
+                    }
+                });
+            });
+        }
+
+        showSyncResultsPopup(crmData, changesCount, vehicleCache = null) {
             const popup = document.createElement('div');
             popup.style.cssText = `
         position: fixed;
@@ -449,7 +548,7 @@
         border-radius: 10px;
         box-shadow: 0 8px 25px rgba(0,0,0,0.15);
         z-index: 10000;
-        max-width: 400px;
+        max-width: 450px;
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
         border-left: 5px solid #1976D2;
         animation: slideInRight 0.5s ease-out;
@@ -459,14 +558,29 @@
             // Data yang ditemukan dari CRM5
             const itemsFound = [];
 
+            // Data yang diupdate ke database
+            itemsFound.push(`<div style="background: rgba(255,255,255,0.3); padding: 8px; border-radius: 6px; margin-bottom: 8px;">
+        <strong>📊 Data yang Diupdate ke Database:</strong>
+    </div>`);
+
             if (crmData.xts_platenumber) itemsFound.push(`🚗 <strong>Nomor Polisi:</strong> ${crmData.xts_platenumber}`);
             if (crmData.xts_customerid) itemsFound.push(`👤 <strong>Customer ID:</strong> ${crmData.xts_customerid}`);
             if (crmData.xts_contactpersonphone) itemsFound.push(`📞 <strong>Telepon CRM:</strong> ${crmData.xts_contactpersonphone}`);
-            if (crmData['a_ac9c1fe7eeef47228a4a87d3d017328d.mobilephone']) itemsFound.push(`📱 <strong>Mobile Phone:</strong> ${crmData['a_ac9c1fe7eeef47228a4a87d3d017328d.mobilephone']}`);
-            if (crmData.xts_serviceadvisorid) itemsFound.push(`👨‍💼 <strong>Service Advisor:</strong> ${crmData.xts_serviceadvisorid}`);
-            if (crmData.xts_totalpartsamount) itemsFound.push(`🔧 <strong>Total Parts:</strong> Rp ${(crmData.xts_totalpartsamount || 0).toLocaleString('id-ID')}`);
-            if (crmData.xts_totalworkamount) itemsFound.push(`🛠️ <strong>Total Work:</strong> Rp ${(crmData.xts_totalworkamount || 0).toLocaleString('id-ID')}`);
-            if (crmData.xts_grandtotalamount) itemsFound.push(`💰 <strong>Grand Total:</strong> Rp ${(crmData.xts_grandtotalamount || 0).toLocaleString('id-ID')}`);
+            if (crmData.xts_vehicleidentificationnumber) itemsFound.push(`🔢 <strong>Nomor Rangka:</strong> ${crmData.xts_vehicleidentificationnumber}`);
+
+            // Info tambahan dari cache
+            if (vehicleCache) {
+                itemsFound.push(`<div style="background: rgba(255,255,255,0.2); padding: 8px; border-radius: 6px; margin: 8px 0;">
+            <strong>💾 Info Tambahan (Cache):</strong>
+        </div>`);
+
+                if (vehicleCache.xts_vehicleidentificationnumber)
+                    itemsFound.push(`🔢 <strong>VIN:</strong> ${vehicleCache.xts_vehicleidentificationnumber}`);
+                if (vehicleCache.xts_productdescription)
+                    itemsFound.push(`🚘 <strong>Model:</strong> ${vehicleCache.xts_productdescription}`);
+                if (vehicleCache.xts_productionyear)
+                    itemsFound.push(`📅 <strong>Tahun:</strong> ${vehicleCache.xts_productionyear}`);
+            }
 
             popup.innerHTML = `
         <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px;">
@@ -480,10 +594,7 @@
         </div>
 
         <div style="font-size: 13px; line-height: 1.4; margin-bottom: 10px;">
-            <div style="background: rgba(255,255,255,0.2); padding: 8px; border-radius: 6px; margin-bottom: 8px;">
-                <strong>📊 Data yang Ditemukan:</strong>
-            </div>
-            <div style="max-height: 200px; overflow-y: auto; padding-right: 5px;">
+            <div style="max-height: 250px; overflow-y: auto; padding-right: 5px;">
                 ${itemsFound.length > 0 ?
                 itemsFound.map(item => `<div style="margin-bottom: 6px; padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.1);">${item}</div>`).join('')
             : '<div style="color: #ffeb3b;">⚠️ Tidak ada data yang bisa diupdate</div>'
@@ -493,12 +604,12 @@
 
         <div style="display: flex; justify-content: space-between; align-items: center; font-size: 12px; background: rgba(255,255,255,0.2); padding: 8px; border-radius: 6px;">
             <span>🔄 Field yang diupdate: <strong>${changesCount}</strong></span>
-            <span>⏱️ Auto close: <strong>5s</strong></span>
+            <span>⏱️ Auto close: <strong>8s</strong></span>
         </div>
 
         <!-- Progress bar -->
         <div style="width: 100%; height: 4px; background: rgba(255,255,255,0.3); border-radius: 2px; margin-top: 10px; overflow: hidden;">
-            <div id="popup-progress" style="width: 100%; height: 100%; background: #4CAF50; border-radius: 2px; transition: width 5s linear;"></div>
+            <div id="popup-progress" style="width: 100%; height: 100%; background: #4CAF50; border-radius: 2px; transition: width 8s linear;"></div>
         </div>
     `;
 
@@ -519,7 +630,6 @@
                     popup.remove();
                 });
 
-                // Hover effect untuk close button
                 closeBtn.addEventListener('mouseenter', () => {
                     closeBtn.style.background = 'rgba(255,255,255,0.2)';
                 });
@@ -528,17 +638,17 @@
                 });
             }
 
-            // Auto remove setelah 5 detik
+            // Auto remove setelah 8 detik
             setTimeout(() => {
                 if (document.body.contains(popup)) {
                     popup.style.animation = 'slideOutRight 0.5s ease-in';
                     setTimeout(() => {
                         if (document.body.contains(popup)) {
-                            document.body.removeChild(popup);
+                            popup.remove();
                         }
                     }, 500);
                 }
-            }, 10000);
+            }, 8000);
         }
 
         async fetchCRM5Data(nopol) {
@@ -570,23 +680,91 @@
                 });
             });
         }
-
         async updateEstimasiFromCRM5(estimasiId, currentData, crmData) {
             if (!crmData) return 0;
 
             const updates = {
                 updated_at: new Date().toISOString(),
-                mra_updated_at: new Date().toISOString() // Juga update timestamp MRA
+                mra_updated_at: new Date().toISOString()
             };
 
             console.log('🔍 Memulai sync CRM5...');
-            console.log('Data saat ini:', {
+            console.log('📋 Data saat ini:', {
                 nama: currentData.name_customer,
                 telepon: currentData.telepon_customer,
-                nopol: currentData.nopol
+                nopol: currentData.nopol,
+                nomor_rangka: currentData.nomor_rangka
             });
 
-            // Ambil nama customer dari Contact dan Account
+            // ====================
+            // 1. AMBIL DATA KENDARAAN UNTUK CACHE DAN UPDATE
+            // ====================
+            let vehicleCache = null;
+            let finalNomorRangka = null;
+
+            try {
+                console.log('🚗 Mencari data kendaraan...');
+                const vehicleInfo = await this.fetchVehicleInfo(currentData.nopol);
+
+                if (vehicleInfo && vehicleInfo.length > 0) {
+                    vehicleCache = vehicleInfo[0];
+
+                    // PRIORITAS 1: Gunakan VIN dari data kendaraan
+                    if (vehicleCache.xts_vehicleidentificationnumber) {
+                        finalNomorRangka = vehicleCache.xts_vehicleidentificationnumber.toString().trim();
+                        console.log('✅ VIN ditemukan dari data kendaraan:', finalNomorRangka);
+                    }
+
+                    // SIMPAN KE LOCALSTORAGE SEBAGAI CACHE
+                    const cacheKey = `vehicle_cache_${currentData.nopol}`;
+                    const cacheData = {
+                        vin: vehicleCache.xts_vehicleidentificationnumber,
+                        model: vehicleCache.xts_productdescription,
+                        tahun: vehicleCache.xts_productionyear,
+                        lastUpdated: new Date().toISOString()
+                    };
+                    localStorage.setItem(cacheKey, JSON.stringify(cacheData));
+                    console.log('💾 Data kendaraan disimpan di cache:', cacheData);
+                } else {
+                    console.log('ℹ️ Data kendaraan tidak ditemukan di CRM5');
+                }
+            } catch (error) {
+                console.error('❌ Error mengambil data kendaraan:', error);
+            }
+
+            // ====================
+            // 2. FALLBACK: Coba ambil VIN dari data CRM5 workorder
+            // ====================
+            if (!finalNomorRangka && crmData.xts_vehicleidentificationnumber) {
+                finalNomorRangka = crmData.xts_vehicleidentificationnumber.toString().trim();
+                console.log('✅ VIN ditemukan dari data workorder:', finalNomorRangka);
+            }
+
+            // ====================
+            // 3. UPDATE NOMOR RANGKA JIKA ADA DATA BARU
+            // ====================
+            if (finalNomorRangka && finalNomorRangka !== "") {
+                const currentRangka = currentData.nomor_rangka || '';
+
+                console.log('🔢 Perbandingan nomor rangka:');
+                console.log('   - Database:', currentRangka);
+                console.log('   - CRM5:', finalNomorRangka);
+                console.log('   - Sama?', currentRangka === finalNomorRangka);
+
+                // PERBAIKAN: Update jika berbeda ATAU jika database kosong
+                if (currentRangka !== finalNomorRangka || currentRangka === '') {
+                    updates.nomor_rangka = finalNomorRangka;
+                    console.log('✅ Akan update nomor rangka:', finalNomorRangka);
+                } else {
+                    console.log('ℹ️ Nomor rangka sama, tidak diupdate');
+                }
+            } else {
+                console.log('❌ Nomor rangka tidak ditemukan di CRM5');
+            }
+
+            // ====================
+            // 4. AMBIL DATA CUSTOMER DARI CRM5 (Contact & Account)
+            // ====================
             const contactId = crmData["_xts_contactpersonid_value"];
             const customerId = crmData["_xts_customerid_value"];
 
@@ -594,7 +772,7 @@
             let namaAccount = null;
             let hpCRM = null;
 
-            // 1. Ambil data dari Contact
+            // 4.1 Ambil data dari Contact
             if (contactId) {
                 try {
                     const contactUrl = `https://tunastoyota.crm5.dynamics.com/api/data/v9.0/contacts(${contactId})`;
@@ -606,7 +784,7 @@
                         credentials: "include"
                     });
                     const contact = await res.json();
-                    namaContact = contact.fullname || contact.firstname || null;
+                    namaContact = contact.fullname.toUpperCase() || contact.firstname.toUpperCase() || null;
                     hpCRM = contact.mobilephone || null;
                     console.log('📞 Data Contact:', { namaContact, hpCRM });
                 } catch (e) {
@@ -614,7 +792,7 @@
                 }
             }
 
-            // 2. Ambil data dari Account
+            // 4.2 Ambil data dari Account
             if (customerId) {
                 try {
                     const accountUrl = `https://tunastoyota.crm5.dynamics.com/api/data/v9.0/accounts(${customerId})`;
@@ -626,14 +804,14 @@
                         credentials: "include"
                     });
                     const account = await res.json();
-                    namaAccount = account.name || account.xts_firstname || null;
+                    namaAccount = account.name.toUpperCase() || account.xts_firstname.toUpperCase() || null;
                     console.log('👤 Data Account:', { namaAccount });
                 } catch (e) {
                     console.warn("❌ Gagal mengambil data account:", e);
                 }
             }
 
-            // 3. Coba ambil nomor telepon dari field lain di CRM5
+            // 4.3 Coba ambil nomor telepon dari field lain di CRM5
             if (!hpCRM) {
                 hpCRM = crmData.xts_contactpersonphone ||
                     crmData['a_ac9c1fe7eeef47228a4a87d3d017328d.mobilephone'] ||
@@ -641,7 +819,9 @@
                 console.log('📱 Coba ambil HP dari field lain:', hpCRM);
             }
 
-            // Format nama customer dengan logika anti-duplikasi
+            // ====================
+            // 5. UPDATE NAMA CUSTOMER (name_customer)
+            // ====================
             let finalNamaCustomer = null;
             const namaContactUpper = namaContact ? namaContact.toUpperCase().trim() : null;
             const namaAccountUpper = namaAccount ? namaAccount.toUpperCase().trim() : null;
@@ -660,11 +840,11 @@
 
             console.log('👨‍💼 Nama customer hasil format:', finalNamaCustomer);
 
-            // PERBAIKAN: Update nama customer
+            // UPDATE NAMA CUSTOMER KE DATABASE
             if (finalNamaCustomer && finalNamaCustomer.trim() !== "") {
                 const currentNama = currentData.name_customer || '';
-                const currentNamaClean = currentNama.toString().trim();
-                const finalNamaClean = finalNamaCustomer.toString().trim();
+                const currentNamaClean = this.formatCustomerName(currentNama);
+                const finalNamaClean = this.formatCustomerName(finalNamaCustomer).toUpperCase();
 
                 if (currentNamaClean !== finalNamaClean) {
                     updates.name_customer = finalNamaClean;
@@ -676,48 +856,33 @@
                 console.log('❌ Nama customer tidak valid dari CRM5');
             }
 
-            // PERBAIKAN BESAR: Update nomor telepon
+            // ====================
+            // 6. UPDATE TELEPON CUSTOMER (telepon_customer)
+            // ====================
             if (hpCRM && hpCRM.toString().trim() !== "") {
                 const currentHp = currentData.telepon_customer || '';
-                const currentHpClean = currentHp.toString().trim();
-                const hpCRMClean = hpCRM.toString().trim();
+                const currentHpClean = this.cleanPhoneNumber(currentHp);
+                const hpCRMClean = this.cleanPhoneNumber(hpCRM);
 
                 console.log('📱 Perbandingan nomor HP:');
                 console.log('   - Database:', currentHpClean);
                 console.log('   - CRM5:', hpCRMClean);
                 console.log('   - Sama?', currentHpClean === hpCRMClean);
 
-                // Kondisi update nomor HP:
-                // 1. Jika nomor HP CRM valid DAN berbeda dengan yang ada
-                // 2. Atau jika di database kosong/null/hanya "-"
-                const shouldUpdateHp = (
-                    hpCRMClean !== "" &&
-                    hpCRMClean !== currentHpClean &&
-                    hpCRMClean !== "-"
-                ) || (
-                    (!currentHpClean || currentHpClean === "" || currentHpClean === "-") &&
-                    hpCRMClean !== "" &&
-                    hpCRMClean !== "-"
-                );
-
-                console.log('   - Should update?', shouldUpdateHp);
-
-                if (shouldUpdateHp) {
+                // Update jika berbeda ATAU jika database kosong
+                if (hpCRMClean !== "" && (hpCRMClean !== currentHpClean || currentHpClean === '')) {
                     updates.telepon_customer = hpCRMClean;
                     console.log('✅ Akan update telepon customer:', hpCRMClean);
                 } else {
-                    console.log('ℹ️ Nomor HP sama/tidak valid, tidak diupdate');
+                    console.log('ℹ️ Nomor HP sama, tidak diupdate');
                 }
             } else {
                 console.log('❌ Nomor HP tidak valid dari CRM5:', hpCRM);
             }
 
-            // Update nomor polisi jika berbeda
-            if (crmData.xts_platenumber && crmData.xts_platenumber !== currentData.nopol) {
-                updates.nopol = crmData.xts_platenumber;
-                console.log('✅ Akan update nopol:', crmData.xts_platenumber);
-            }
-
+            // ====================
+            // 7. EKSEKUSI UPDATE KE DATABASE
+            // ====================
             // Hitung perubahan (exclude timestamp fields)
             const changeFields = Object.keys(updates).filter(key =>
                                                              !['updated_at', 'mra_updated_at'].includes(key)
@@ -735,7 +900,7 @@
                     .from("estimasi")
                     .update(updates)
                     .eq("id", estimasiId)
-                    .select(); // Tambahkan select untuk melihat hasil
+                    .select();
 
                     if (error) {
                         console.error('❌ Error update database:', error);
@@ -744,17 +909,22 @@
 
                     console.log('✅ Data berhasil diupdate di database');
                     if (data && data.length > 0) {
-                        console.log('📝 Data setelah update:', data[0]);
+                        console.log('📝 Data setelah update:', {
+                            name_customer: data[0].name_customer,
+                            telepon_customer: data[0].telepon_customer,
+                            nomor_rangka: data[0].nomor_rangka
+                        });
                     }
 
-                    return changesCount;
+                    // Kembalikan vehicleCache untuk ditampilkan di popup
+                    return { changesCount, vehicleCache };
                 } catch (error) {
                     console.error('❌ Error dalam proses update:', error);
                     throw error;
                 }
             } else {
                 console.log('ℹ️ Tidak ada perubahan data yang diperlukan');
-                return 0;
+                return { changesCount: 0, vehicleCache };
             }
         }
 
@@ -792,7 +962,7 @@
             <i class="material-icons" style="vertical-align: middle; margin-right: 12px; font-size: 32px;">campaign</i>
             MRA Follow-up System
         </h1>
-        <p style="margin: 8px 0 0 0; opacity: 0.9; font-size: 16px;">Sistem Follow-up Customer Berdasarkan Estimasi PTM</p>
+        <p style="margin: 8px 0 0 0; opacity: 0.9; font-size: 16px;">Design by Magenta Project</p>
     </div>
     <div style="display: flex; align-items: center; gap: 10px;">
         <button id="tab-toggle" class="btn-primary" style="display: flex; align-items: center; gap: 10px; padding: 12px 16px; font-size: 16px;">
@@ -1225,9 +1395,9 @@
                 const { data: estimasiData, error: estimasiError } = await supabase
                 .from('estimasi')
                 .select(`
-                        *,
-                        users:teknisi_id (full_name, email)
-                    `)
+                *,
+                users:teknisi_id (full_name, email)
+            `)
                 .order('created_at', { ascending: false });
 
                 if (estimasiError) throw estimasiError;
@@ -1238,6 +1408,15 @@
                 }));
 
                 this.filteredData = [...this.estimasiData];
+
+                // AUTO SELECT: Pilih estimasi pertama jika ada data
+                if (this.estimasiData.length > 0 && !this.currentDetail) {
+                    this.selectedId = this.estimasiData[0].id;
+                    this.currentDetail = this.estimasiData[0];
+                    currentEstimasiId = this.estimasiData[0].id;
+                    this.customerDetail = null;
+                }
+
                 this.renderCurrentTab();
                 this.showNotification('Data berhasil dimuat!', 'success');
 
@@ -1505,7 +1684,7 @@ word-break: break-word !important;
                     <h3 style="margin: 0 0 15px 0; color: #0b3d91; font-size: 18px; font-weight: 600;">
                         <i class="material-icons colored-icon"
                            style="vertical-align: middle; margin-right: 8px; font-size: 20px;">list</i>
-                        Daftar Estimasi (${notAcceptData.length})
+                        Daftar Estimasi (Data lengkap : ${notAcceptData.length})
                     </h3>
 
                     <div style="position: relative; width: 100%; margin-bottom: 12px;">
@@ -1619,18 +1798,18 @@ word-break: break-word !important;
         }
 
 
-renderNotAcceptTableRows(data) {
-    const displayData = this.filteredData && this.filteredData.length > 0 ? this.filteredData : data;
+        renderNotAcceptTableRows(data) {
+            const displayData = this.filteredData && this.filteredData.length > 0 ? this.filteredData : data;
 
-    if (displayData.length === 0) {
-        return '<tr><td colspan="4" style="text-align: center; padding: 30px; color: #666; font-size: 14px;">Tidak ada data estimasi completed</td></tr>';
-    }
+            if (displayData.length === 0) {
+                return '<tr><td colspan="4" style="text-align: center; padding: 30px; color: #666; font-size: 14px;">Tidak ada data estimasi completed</td></tr>';
+            }
 
-    return displayData.map((estimasi, index) => {
-        const statusBadge = this.getMRAStatusBadge(estimasi.mra_status);
-        const { hasSparepart, hasService, sparepartCount, serviceCount } = this.checkEstimasiCompleteness(estimasi);
+            return displayData.map((estimasi, index) => {
+                const statusBadge = this.getMRAStatusBadge(estimasi.mra_status);
+                const { hasSparepart, hasService, sparepartCount, serviceCount } = this.checkEstimasiCompleteness(estimasi);
 
-        return `
+                return `
             <tr data-id="${estimasi.id}" style="cursor: pointer; background: ${estimasi.id === this.selectedId ? '#e3f2fd' : 'transparent'}; font-size: 14px;">
                 <td style="padding: 12px; text-align: center;">${index + 1}</td>
                 <td style="padding: 12px; font-weight: 500;">${estimasi.nopol || '-'}</td>
@@ -1665,35 +1844,35 @@ renderNotAcceptTableRows(data) {
             }).join('');
         }
 
-renderDetailContentLeft() {
-    if (!this.currentDetail) {
-        return '<div style="text-align: center; color: #666; padding: 60px 20px; font-size: 16px;">Pilih estimasi untuk melihat detail</div>';
-    }
+        renderDetailContentLeft() {
+            if (!this.currentDetail) {
+                return '<div style="text-align: center; color: #666; padding: 60px 20px; font-size: 16px;">Pilih estimasi untuk melihat detail</div>';
+            }
 
-    const estimasi = this.currentDetail;
-    const spareparts = this.parseSpareparts(estimasi);
-    const services = this.parseServices(estimasi);
+            const estimasi = this.currentDetail;
+            const spareparts = this.parseSpareparts(estimasi);
+            const services = this.parseServices(estimasi);
 
-    // Render foto section - dipindah ke atas
-    const fotoSection = this.renderFotoSection(estimasi);
+            // Render foto section - dipindah ke atas
+            const fotoSection = this.renderFotoSection(estimasi);
 
-    let totalSparepart = 0;
-    let totalService = 0;
+            let totalSparepart = 0;
+            let totalService = 0;
 
-    spareparts.forEach(part => {
-        totalSparepart += (part.price || 0) * (part.qty || 1);
-    });
+            spareparts.forEach(part => {
+                totalSparepart += (part.price || 0) * (part.qty || 1);
+            });
 
-    services.forEach(service => {
-        totalService += (service.price || 0) * (service.hour || 1);
-    });
+            services.forEach(service => {
+                totalService += (service.price || 0) * (service.hour || 1);
+            });
 
-    // Di dalam renderDetailContentLeft(), pastikan menggunakan this.diskonSettings
-    const sparepartAfterDiscount = totalSparepart * (1 - this.diskonSettings.sparepart / 100);
-    const serviceAfterDiscount = totalService * (1 - this.diskonSettings.jasa / 100);
-    const totalKeseluruhan = Math.round(sparepartAfterDiscount + serviceAfterDiscount);
+            // Di dalam renderDetailContentLeft(), pastikan menggunakan this.diskonSettings
+            const sparepartAfterDiscount = totalSparepart * (1 - this.diskonSettings.sparepart / 100);
+            const serviceAfterDiscount = totalService * (1 - this.diskonSettings.jasa / 100);
+            const totalKeseluruhan = Math.round(sparepartAfterDiscount + serviceAfterDiscount);
 
-    return `
+            return `
         <div style="space-y-4">
             <!-- Foto Estimasi - DIPINDAH KE ATAS -->
             ${fotoSection}
@@ -1800,14 +1979,14 @@ renderDetailContentLeft() {
     `;
         }
 
-renderDetailContentRight() {
-    if (!this.currentDetail) {
-        return '<div style="text-align: center; color: #666; padding: 60px 20px; font-size: 16px;">Pilih estimasi untuk melihat template</div>';
-    }
+        renderDetailContentRight() {
+            if (!this.currentDetail) {
+                return '<div style="text-align: center; color: #666; padding: 60px 20px; font-size: 16px;">Pilih estimasi untuk melihat template</div>';
+            }
 
-    const estimasi = this.currentDetail;
+            const estimasi = this.currentDetail;
 
-    return `
+            return `
         <div style="space-y-4">
             <!-- Template WhatsApp -->
             <div style="background: white; padding: 15px; border-radius: 6px; border: 1px solid #e0e0e0;">
@@ -1821,61 +2000,51 @@ renderDetailContentRight() {
                     ${this.generateWhatsAppTemplateByType(estimasi, 'formal_ramah')}
                 </div>
 
-                <!-- Tombol Pilihan Template dengan Edit masing-masing -->
-                <div style="margin-top: 15px;">
-                    <label style="display: block; margin-bottom: 8px; font-weight: 500; font-size: 14px; color: #333;">Pilih Template:</label>
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px;">
-                        <!-- Template 1 -->
-                        <div style="display: flex; gap: 4px;">
-                            <button type="button" class="template-btn btn-small active" data-template="formal_ramah" style="flex: 1; background: #1976d2; color: white; border: 1px solid #1976d2;">
-                                Opsi 1 — Formal Ramah
-                            </button>
-                            <button type="button" class="edit-template-btn btn-small" data-template="formal_ramah" style="background: #ff9800; color: white; border: none; padding: 8px; border-radius: 4px;">
-                                <i class="material-icons" style="font-size: 14px;">edit</i>
-                            </button>
-                        </div>
+      <!-- Tombol Pilihan Template dengan Edit masing-masing -->
+<div style="margin-top: 15px;">
+    <label style="display: block; margin-bottom: 8px; font-weight: 500; font-size: 14px; color: #333;">Pilih Template:</label>
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px;">
+        <!-- Template 1 - Inti Estimasi -->
+        <div style="display: flex; gap: 4px;">
+            <button type="button" class="template-btn btn-small active" data-template="inti_estimasi" style="flex: 1; background: #1976d2; color: white; border: 1px solid #1976d2;">
+                Template 1 — Inti Estimasi
+            </button>
+            <button type="button" class="edit-template-btn btn-small" data-template="inti_estimasi" style="background: #ff9800; color: white; border: none; padding: 8px; border-radius: 4px;">
+                <i class="material-icons" style="font-size: 14px;">edit</i>
+            </button>
+        </div>
 
-                        <!-- Template 2 -->
-                        <div style="display: flex; gap: 4px;">
-                            <button type="button" class="template-btn btn-small" data-template="sangat_formal" style="flex: 1; background: #e3f2fd; color: #1976d2; border: 1px solid #bbdefb;">
-                                Opsi 2 — Sangat Formal
-                            </button>
-                            <button type="button" class="edit-template-btn btn-small" data-template="sangat_formal" style="background: #ff9800; color: white; border: none; padding: 8px; border-radius: 4px;">
-                                <i class="material-icons" style="font-size: 14px;">edit</i>
-                            </button>
-                        </div>
+        <!-- Template 2 - Daftar Harga -->
+        <div style="display: flex; gap: 4px;">
+            <button type="button" class="template-btn btn-small" data-template="daftar_harga" style="flex: 1; background: #e3f2fd; color: #1976d2; border: 1px solid #bbdefb;">
+                Template 2 — Daftar Harga
+            </button>
+            <button type="button" class="edit-template-btn btn-small" data-template="daftar_harga" style="background: #ff9800; color: white; border: none; padding: 8px; border-radius: 4px;">
+                <i class="material-icons" style="font-size: 14px;">edit</i>
+            </button>
+        </div>
 
-                        <!-- Template 3 -->
-                        <div style="display: flex; gap: 4px;">
-                            <button type="button" class="template-btn btn-small" data-template="formal_bersahabat" style="flex: 1; background: #e3f2fd; color: #1976d2; border: 1px solid #bbdefb;">
-                                Opsi 3 — Formal Bersahabat
-                            </button>
-                            <button type="button" class="edit-template-btn btn-small" data-template="formal_bersahabat" style="background: #ff9800; color: white; border: none; padding: 8px; border-radius: 4px;">
-                                <i class="material-icons" style="font-size: 14px;">edit</i>
-                            </button>
-                        </div>
+        <!-- Template 3 - Tidak Tertarik -->
+        <div style="display: flex; gap: 4px;">
+            <button type="button" class="template-btn btn-small" data-template="respon_tidak_tertarik" style="flex: 1; background: #e3f2fd; color: #1976d2; border: 1px solid #bbdefb;">
+                Template 3 — Tidak Tertarik
+            </button>
+            <button type="button" class="edit-template-btn btn-small" data-template="respon_tidak_tertarik" style="background: #ff9800; color: white; border: none; padding: 8px; border-radius: 4px;">
+                <i class="material-icons" style="font-size: 14px;">edit</i>
+            </button>
+        </div>
 
-                        <!-- Template 4 -->
-                        <div style="display: flex; gap: 4px;">
-                            <button type="button" class="template-btn btn-small" data-template="singkat_padat" style="flex: 1; background: #e3f2fd; color: #1976d2; border: 1px solid #bbdefb;">
-                                Opsi 4 — Singkat & Padat
-                            </button>
-                            <button type="button" class="edit-template-btn btn-small" data-template="singkat_padat" style="background: #ff9800; color: white; border: none; padding: 8px; border-radius: 4px;">
-                                <i class="material-icons" style="font-size: 14px;">edit</i>
-                            </button>
-                        </div>
-
-                        <!-- Template 5 -->
-                        <div style="display: flex; gap: 4px; grid-column: 1 / -1;">
-                            <button type="button" class="template-btn btn-small" data-template="elegan_customer" style="flex: 1; background: #e3f2fd; color: #1976d2; border: 1px solid #bbdefb;">
-                                Opsi 5 — Elegan & Customer-Oriented
-                            </button>
-                            <button type="button" class="edit-template-btn btn-small" data-template="elegan_customer" style="background: #ff9800; color: white; border: none; padding: 8px; border-radius: 4px;">
-                                <i class="material-icons" style="font-size: 14px;">edit</i>
-                            </button>
-                        </div>
-                    </div>
-                </div>
+        <!-- Template 4 - Respon Tertarik -->
+        <div style="display: flex; gap: 4px;">
+            <button type="button" class="template-btn btn-small" data-template="respon_tertarik" style="flex: 1; background: #e3f2fd; color: #1976d2; border: 1px solid #bbdefb;">
+                Template 4 — Respon Tertarik
+            </button>
+            <button type="button" class="edit-template-btn btn-small" data-template="respon_tertarik" style="background: #ff9800; color: white; border: none; padding: 8px; border-radius: 4px;">
+                <i class="material-icons" style="font-size: 14px;">edit</i>
+            </button>
+        </div>
+    </div>
+</div>
 
                 <!-- Tombol Kirim WhatsApp -->
                 <div style="margin-top: 15px; display: flex; gap: 10px;">
@@ -1928,166 +2097,109 @@ renderDetailContentRight() {
     `;
         }
 
-generateWhatsAppTemplateByType(estimasi, templateType = 'formal_ramah') {
-    const spareparts = this.parseSpareparts(estimasi);
-    const services = this.parseServices(estimasi);
-    const customTemplate = this.loadCustomTemplate(templateType);
-    if (customTemplate) {
-        return customTemplate.replace(/\n/g, '<br>');
-    }
-
-    let totalSparepartNormal = 0;
-    let totalSparepartDiskon = 0;
-    let totalServiceNormal = 0;
-    let totalServiceDiskon = 0;
-
-    // Hitung total sparepart sebelum dan sesudah diskon
-    spareparts.forEach(part => {
-        const hargaNormal = (part.price || 0) * (part.qty || 1);
-        const hargaDiskon = hargaNormal * (1 - this.diskonSettings.sparepart / 100);
-        totalSparepartNormal += hargaNormal;
-        totalSparepartDiskon += hargaDiskon;
-    });
-
-    // Hitung total jasa sebelum dan sesudah diskon
-    services.forEach(service => {
-        const hargaNormal = (service.price || 0) * (service.hour || 1);
-        const hargaDiskon = hargaNormal * (1 - this.diskonSettings.jasa / 100);
-        totalServiceNormal += hargaNormal;
-        totalServiceDiskon += hargaDiskon;
-    });
-
-    const totalSebelumDiskon = totalSparepartNormal + totalServiceNormal;
-    const totalSetelahDiskon = totalSparepartDiskon + totalServiceDiskon;
-    const totalDiskon = totalSebelumDiskon - totalSetelahDiskon;
-
-    // Format nama customer
-    const namaCustomer = estimasi.name_customer || 'Bapak/Ibu';
-    const panggilan = namaCustomer.includes(' ') ? namaCustomer.split(' ')[0] : namaCustomer;
-
-    // Hitung hari sejak created_at
-    const hariLalu = this.hitungHariLalu(estimasi.created_at);
-
-    // Format sparepart
-    let sparepartTemplate = '';
-    if (spareparts.length > 0) {
-        sparepartTemplate = `🔧 *Estimasi Sparepart* ${this.diskonSettings.sparepart > 0 ? `(Diskon ${this.diskonSettings.sparepart}%)` : ''}\n\n`;
-
-        spareparts.forEach(part => {
-            const hargaNormal = (part.price || 0) * (part.qty || 1);
-            const hargaDiskon = hargaNormal * (1 - this.diskonSettings.sparepart / 100);
-
-            if (this.diskonSettings.sparepart > 0) {
-                sparepartTemplate += `• ${part.name || 'Sparepart'}\n`;
-                sparepartTemplate += `  Rp ${hargaNormal.toLocaleString('id-ID')} → Rp ${Math.round(hargaDiskon).toLocaleString('id-ID')}\n\n`;
-            } else {
-                sparepartTemplate += `• ${part.name || 'Sparepart'}\n`;
-                sparepartTemplate += `  Rp ${hargaNormal.toLocaleString('id-ID')}\n\n`;
+        generateWhatsAppTemplateByType(estimasi, templateType = 'inti_estimasi') {
+            const spareparts = this.parseSpareparts(estimasi);
+            const services = this.parseServices(estimasi);
+            const customTemplate = this.loadCustomTemplate(templateType);
+            if (customTemplate) {
+                return customTemplate.replace(/\n/g, '<br>');
             }
-        });
 
-        if (this.diskonSettings.sparepart > 0) {
-            sparepartTemplate += `*Total Sparepart:*\n`;
-            sparepartTemplate += `Rp ${totalSparepartNormal.toLocaleString('id-ID')} → Rp ${Math.round(totalSparepartDiskon).toLocaleString('id-ID')}\n\n`;
-        } else {
-            sparepartTemplate += `*Total Sparepart:* Rp ${totalSparepartNormal.toLocaleString('id-ID')}\n\n`;
-        }
-    }
+            let totalSparepartNormal = 0;
+            let totalSparepartDiskon = 0;
+            let totalServiceNormal = 0;
+            let totalServiceDiskon = 0;
 
-    // Format jasa
-    let jasaTemplate = '';
-    if (services.length > 0) {
-        jasaTemplate = `🧰 *Jasa Pengerjaan* ${this.diskonSettings.jasa > 0 ? `(Diskon ${this.diskonSettings.jasa}%)` : ''}\n\n`;
+            // Hitung total sparepart sebelum dan sesudah diskon
+            spareparts.forEach(part => {
+                const hargaNormal = (part.price || 0) * (part.qty || 1);
+                const hargaDiskon = hargaNormal * (1 - this.diskonSettings.sparepart / 100);
+                totalSparepartNormal += hargaNormal;
+                totalSparepartDiskon += hargaDiskon;
+            });
 
-        services.forEach(service => {
-            const hargaNormal = (service.price || 0) * (service.hour || 1);
-            const hargaDiskon = hargaNormal * (1 - this.diskonSettings.jasa / 100);
+            // Hitung total jasa sebelum dan sesudah diskon
+            services.forEach(service => {
+                const hargaNormal = (service.price || 0) * (service.hour || 1);
+                const hargaDiskon = hargaNormal * (1 - this.diskonSettings.jasa / 100);
+                totalServiceNormal += hargaNormal;
+                totalServiceDiskon += hargaDiskon;
+            });
 
-            if (this.diskonSettings.jasa > 0) {
-                jasaTemplate += `• ${service.name || 'Jasa'}\n`;
-                jasaTemplate += `  Rp ${hargaNormal.toLocaleString('id-ID')} → Rp ${Math.round(hargaDiskon).toLocaleString('id-ID')}\n\n`;
-            } else {
-                jasaTemplate += `• ${service.name || 'Jasa'}\n`;
-                jasaTemplate += `  Rp ${hargaNormal.toLocaleString('id-ID')}\n\n`;
-            }
-        });
+            const totalSebelumDiskon = totalSparepartNormal + totalServiceNormal;
+            const totalSetelahDiskon = totalSparepartDiskon + totalServiceDiskon;
+            const totalDiskon = totalSebelumDiskon - totalSetelahDiskon;
 
-        if (this.diskonSettings.jasa > 0) {
-            jasaTemplate += `*Total Jasa:*\n`;
-            jasaTemplate += `Rp ${totalServiceNormal.toLocaleString('id-ID')} → Rp ${Math.round(totalServiceDiskon).toLocaleString('id-ID')}\n\n`;
-        } else {
-            jasaTemplate += `*Total Jasa:* Rp ${totalServiceNormal.toLocaleString('id-ID')}\n\n`;
-        }
-    }
+            // Format nama customer
+            const namaCustomer = estimasi.name_customer || 'Bapak/Ibu';
 
-    // Template berdasarkan jenis
-    let template = '';
+            // Hitung hari sejak created_at
+            const hariLalu = this.hitungHariLalu(estimasi.created_at);
 
-    switch(templateType) {
-        case 'sangat_formal':
-            template = `Selamat siang ${namaCustomer},
+            // Template berdasarkan jenis
+            let template = '';
 
-Menindaklanjuti kedatangan servis pada ${hariLalu}, berikut kami sampaikan rincian estimasi biaya untuk kendaraan ${estimasi.jenis_mobil || ''} ${estimasi.nopol || ''}, nomor rangka ${estimasi.nomor_rangka || '-'}:
+            switch(templateType) {
+                case 'daftar_harga':
+                    // TEMPLATE 2: Daftar Harga Komponen (untuk copy-paste ke customer)
+                    let sparepartList = '';
+                    let jasaList = '';
 
-${sparepartTemplate}${jasaTemplate}💰 *Total Estimasi Keseluruhan:* Rp ${Math.round(totalSetelahDiskon).toLocaleString('id-ID')}
+                    // Format sparepart
+                    if (spareparts.length > 0) {
+                        sparepartList = `🔧 SPAREPART:\n`;
+                        spareparts.forEach(part => {
+                            const hargaNormal = (part.price || 0) * (part.qty || 1);
+                            const hargaDiskon = hargaNormal * (1 - this.diskonSettings.sparepart / 100);
 
-Apabila Bapak/Ibu bersedia, kami dapat mengatur jadwal pengerjaan pada hari ini atau sesuai waktu yang Bapak/Ibu tentukan.
+                            sparepartList += `• ${part.name || 'Sparepart'}\n`;
+                            sparepartList += `  Harga normal: Rp ${hargaNormal.toLocaleString('id-ID')}\n`;
+                            sparepartList += `  Harga diskon: Rp ${Math.round(hargaDiskon).toLocaleString('id-ID')} (${this.diskonSettings.sparepart}% diskon)\n\n`;
+                        });
+                    }
 
-Hormat kami,
-Tunas Toyota Batu Tulis`;
+                    // Format jasa
+                    if (services.length > 0) {
+                        jasaList = `🧰 JASA:\n`;
+                        services.forEach(service => {
+                            const hargaNormal = (service.price || 0) * (service.hour || 1);
+                            const hargaDiskon = hargaNormal * (1 - this.diskonSettings.jasa / 100);
+
+                            jasaList += `• ${service.name || 'Jasa'}\n`;
+                            jasaList += `  Harga normal: Rp ${hargaNormal.toLocaleString('id-ID')}\n`;
+                            jasaList += `  Harga diskon: Rp ${Math.round(hargaDiskon).toLocaleString('id-ID')} (${this.diskonSettings.jasa}% diskon)\n\n`;
+                        });
+                    }
+
+                    template = `${sparepartList}${jasaList}`;
                     break;
 
-                case 'formal_bersahabat':
-                    template = `Halo ${panggilan} ${estimasi.name_customer ? '👋🙂' : '👋'}
-
-Sebagai tindak lanjut dari kunjungan servis ${hariLalu}, berikut kami kirimkan estimasi perbaikan untuk unit ${estimasi.jenis_mobil || ''} ${estimasi.nopol || ''} (No. rangka: ${estimasi.nomor_rangka || '-'}):
-
-${sparepartTemplate}${jasaTemplate}💰 *Total Estimasi:* Rp ${Math.round(totalSetelahDiskon).toLocaleString('id-ID')}
-
-Jika Bapak/Ibu berkenan, kami siap menjadwalkan pengerjaan pada hari ini atau kapan pun sesuai waktu Bapak/Ibu 😊🙏
-
-Hormat kami,
-Tunas Toyota Batu Tulis 🚗✨`;
+                case 'respon_tidak_tertarik':
+                    // TEMPLATE 3: Respon Tidak Tertarik
+                    template = `Terima kasih atas waktunya. Kami tunggu konfirmasi penggantian di nomor ini. Jika suatu hari membutuhkan bantuan teknis atau penjadwalan pergantian part, kami siap membantu. Terima kasih atas kepercayaannya.`;
                     break;
 
-                case 'singkat_padat':
-                    template = `Selamat siang ${namaCustomer},
-
-Berikut kami sampaikan estimasi biaya sparepart dan jasa untuk kendaraan ${estimasi.jenis_mobil || ''} ${estimasi.nopol || ''} (No. rangka: ${estimasi.nomor_rangka || '-'}), terkait kunjungan servis ${hariLalu}:
-
-${spareparts.length > 0 ? `🔧 *Estimasi Sparepart* — Total: Rp ${Math.round(totalSparepartDiskon).toLocaleString('id-ID')}\n` : ''}${services.length > 0 ? `🧰 *Jasa Pengerjaan* — Total: Rp ${Math.round(totalServiceDiskon).toLocaleString('id-ID')}\n` : ''}
-💰 *Total Estimasi:* Rp ${Math.round(totalSetelahDiskon).toLocaleString('id-ID')}
-
-Silakan informasikan waktu yang sesuai apabila Bapak/Ibu berkenan untuk melanjutkan pekerjaan.
-
-Hormat kami,
-    Tunas Toyota Batu Tulis`;
+                case 'respon_tertarik':
+                    // TEMPLATE 4: Respon Tertarik
+                    template = `Terimakasih sudah memberikan kepercayaan untuk mengganti sparepart di Tunas Toyota Batutulis, Kami pastikan sparepart original Toyota dan memberikan pelayanan terbaik kami 🙏`;
                     break;
 
-                case 'elegan_customer':
-                    template = `Halo ${panggilan} ${estimasi.name_customer ? '👋🙂' : '👋'}
-
-Sebagai bentuk pelayanan kami, berikut kami lampirkan estimasi resmi atas kebutuhan perbaikan kendaraan ${estimasi.jenis_mobil || ''} ${estimasi.nopol || ''} (Nomor rangka: ${estimasi.nomor_rangka || '-'}) dari kunjungan servis ${hariLalu}:
-
-${sparepartTemplate}${jasaTemplate}🧾 *Ringkasan Total*
-💰 *Total Estimasi Keseluruhan:* Rp ${Math.round(totalSetelahDiskon).toLocaleString('id-ID')}
-
-Apabila Bapak/Ibu berkenan, kami siap membantu penjadwalan pengerjaan pada hari ini ataupun sesuai waktu pilihan Bapak/Ibu 😊🙏
-
-Hormat kami,
-Tunas Toyota Batu Tulis 🚗✨`;
-                    break;
-
-                case 'formal_ramah':
+                case 'inti_estimasi':
                 default:
-                    template = `Halo ${panggilan} ${estimasi.name_customer ? '👋🙂' : '👋'}
+                    // TEMPLATE 1: Inti Estimasi dengan Diskon
+                    template = `Bapak/Ibu ${namaCustomer} yang terhormat,
 
-Terkait kunjungan servis Bapak/Ibu ${hariLalu}, berikut kami sampaikan estimasi pekerjaan untuk ${estimasi.jenis_mobil || ''} ${estimasi.nopol || ''} (No. rangka: ${estimasi.nomor_rangka || '-'}):
+Terkait kunjungan servis ${hariLalu}, berikut kami lampirkan saran perbaikan untuk ${estimasi.jenis_mobil || ''} ${estimasi.nopol || ''} ${estimasi.nomor_rangka ? `(Nomor rangka: ${estimasi.nomor_rangka})` : ''}.
 
-${sparepartTemplate}${jasaTemplate}🧾 *Total Estimasi*
-💰 Rp ${Math.round(totalSetelahDiskon).toLocaleString('id-ID')}
+Kami berikan diskon spesial:
+${this.diskonSettings.sparepart > 0 ? `• Diskon sparepart ${this.diskonSettings.sparepart}%\n` : ''}${this.diskonSettings.jasa > 0 ? `• Diskon jasa ${this.diskonSettings.jasa}%\n` : ''}
+💰 RINGKASAN HARGA:
 
-Apabila Bapak/Ibu berkenan, pekerjaan dapat segera kami jadwalkan hari ini atau pada waktu yang Bapak/Ibu inginkan 😊🙏
+Total Normal: ~~Rp ${totalSebelumDiskon.toLocaleString('id-ID')}~~
+Total Diskon: Rp ${Math.round(totalDiskon).toLocaleString('id-ID')}
+*TOTAL SETELAH DISKON: Rp ${Math.round(totalSetelahDiskon).toLocaleString('id-ID')}*
+
+Pekerjaan dapat kami jadwalkan segera setelah konfirmasi dari Bapak/Ibu.
 
 Hormat kami,
 Tunas Toyota Batu Tulis 🚗✨`;
@@ -2098,98 +2210,98 @@ Tunas Toyota Batu Tulis 🚗✨`;
         }
 
 
-generateWhatsAppTemplate(estimasi) {
-    const spareparts = this.parseSpareparts(estimasi);
-    const services = this.parseServices(estimasi);
+        generateWhatsAppTemplate(estimasi) {
+            const spareparts = this.parseSpareparts(estimasi);
+            const services = this.parseServices(estimasi);
 
-    let totalSparepartNormal = 0;
-    let totalSparepartDiskon = 0;
-    let totalServiceNormal = 0;
-    let totalServiceDiskon = 0;
+            let totalSparepartNormal = 0;
+            let totalSparepartDiskon = 0;
+            let totalServiceNormal = 0;
+            let totalServiceDiskon = 0;
 
-    // Hitung total sparepart sebelum dan sesudah diskon
-    spareparts.forEach(part => {
-        const hargaNormal = (part.price || 0) * (part.qty || 1);
-        const hargaDiskon = hargaNormal * (1 - this.diskonSettings.sparepart / 100);
-        totalSparepartNormal += hargaNormal;
-        totalSparepartDiskon += hargaDiskon;
-    });
+            // Hitung total sparepart sebelum dan sesudah diskon
+            spareparts.forEach(part => {
+                const hargaNormal = (part.price || 0) * (part.qty || 1);
+                const hargaDiskon = hargaNormal * (1 - this.diskonSettings.sparepart / 100);
+                totalSparepartNormal += hargaNormal;
+                totalSparepartDiskon += hargaDiskon;
+            });
 
-    // Hitung total jasa sebelum dan sesudah diskon
-    services.forEach(service => {
-        const hargaNormal = (service.price || 0) * (service.hour || 1);
-        const hargaDiskon = hargaNormal * (1 - this.diskonSettings.jasa / 100);
-        totalServiceNormal += hargaNormal;
-        totalServiceDiskon += hargaDiskon;
-    });
+            // Hitung total jasa sebelum dan sesudah diskon
+            services.forEach(service => {
+                const hargaNormal = (service.price || 0) * (service.hour || 1);
+                const hargaDiskon = hargaNormal * (1 - this.diskonSettings.jasa / 100);
+                totalServiceNormal += hargaNormal;
+                totalServiceDiskon += hargaDiskon;
+            });
 
-    const totalSebelumDiskon = totalSparepartNormal + totalServiceNormal;
-    const totalSetelahDiskon = totalSparepartDiskon + totalServiceDiskon;
-    const totalDiskon = totalSebelumDiskon - totalSetelahDiskon;
+            const totalSebelumDiskon = totalSparepartNormal + totalServiceNormal;
+            const totalSetelahDiskon = totalSparepartDiskon + totalServiceDiskon;
+            const totalDiskon = totalSebelumDiskon - totalSetelahDiskon;
 
-    // Format nama customer
-    const namaCustomer = estimasi.name_customer || 'Kak';
-    const panggilan = namaCustomer.includes(' ') ? namaCustomer.split(' ')[0] : namaCustomer;
+            // Format nama customer
+            const namaCustomer = estimasi.name_customer || 'Kak';
+            const panggilan = namaCustomer.includes(' ') ? namaCustomer.split(' ')[0] : namaCustomer;
 
-    // Hitung hari sejak created_at
-    const hariLalu = this.hitungHariLalu(estimasi.created_at);
+            // Hitung hari sejak created_at
+            const hariLalu = this.hitungHariLalu(estimasi.created_at);
 
-    // Format sparepart dengan diskon per item
-    let sparepartTemplate = '';
-    if (spareparts.length > 0) {
-        sparepartTemplate = `🔧 *Estimasi Sparepart* ${this.diskonSettings.sparepart > 0 ? `(Diskon ${this.diskonSettings.sparepart}%)` : ''}\n\n`;
+            // Format sparepart dengan diskon per item
+            let sparepartTemplate = '';
+            if (spareparts.length > 0) {
+                sparepartTemplate = `🔧 *Estimasi Sparepart* ${this.diskonSettings.sparepart > 0 ? `(Diskon ${this.diskonSettings.sparepart}%)` : ''}\n\n`;
 
-        spareparts.forEach(part => {
-            const hargaNormal = (part.price || 0) * (part.qty || 1);
-            const hargaDiskon = hargaNormal * (1 - this.diskonSettings.sparepart / 100);
+                spareparts.forEach(part => {
+                    const hargaNormal = (part.price || 0) * (part.qty || 1);
+                    const hargaDiskon = hargaNormal * (1 - this.diskonSettings.sparepart / 100);
 
-            if (this.diskonSettings.sparepart > 0) {
-                sparepartTemplate += `• ${part.name || 'Sparepart'}\n`;
-                sparepartTemplate += `  Rp ${hargaNormal.toLocaleString('id-ID')} → Rp ${Math.round(hargaDiskon).toLocaleString('id-ID')}\n\n`;
-            } else {
-                sparepartTemplate += `• ${part.name || 'Sparepart'}\n`;
-                sparepartTemplate += `  Rp ${hargaNormal.toLocaleString('id-ID')}\n\n`;
+                    if (this.diskonSettings.sparepart > 0) {
+                        sparepartTemplate += `• ${part.name || 'Sparepart'}\n`;
+                        sparepartTemplate += `  Rp ${hargaNormal.toLocaleString('id-ID')} → Rp ${Math.round(hargaDiskon).toLocaleString('id-ID')}\n\n`;
+                    } else {
+                        sparepartTemplate += `• ${part.name || 'Sparepart'}\n`;
+                        sparepartTemplate += `  Rp ${hargaNormal.toLocaleString('id-ID')}\n\n`;
+                    }
+                });
+
+                // Total sparepart
+                if (this.diskonSettings.sparepart > 0) {
+                    sparepartTemplate += `*Total Sparepart:*\n`;
+                    sparepartTemplate += `Rp ${totalSparepartNormal.toLocaleString('id-ID')} → Rp ${Math.round(totalSparepartDiskon).toLocaleString('id-ID')}\n\n`;
+                } else {
+                    sparepartTemplate += `*Total Sparepart:* Rp ${totalSparepartNormal.toLocaleString('id-ID')}\n\n`;
+                }
             }
-        });
 
-        // Total sparepart
-        if (this.diskonSettings.sparepart > 0) {
-            sparepartTemplate += `*Total Sparepart:*\n`;
-            sparepartTemplate += `Rp ${totalSparepartNormal.toLocaleString('id-ID')} → Rp ${Math.round(totalSparepartDiskon).toLocaleString('id-ID')}\n\n`;
-        } else {
-            sparepartTemplate += `*Total Sparepart:* Rp ${totalSparepartNormal.toLocaleString('id-ID')}\n\n`;
-        }
-    }
+            // Format jasa dengan diskon per item
+            let jasaTemplate = '';
+            if (services.length > 0) {
+                jasaTemplate = `🧰 *Jasa Pengerjaan* ${this.diskonSettings.jasa > 0 ? `(Diskon ${this.diskonSettings.jasa}%)` : ''}\n\n`;
 
-    // Format jasa dengan diskon per item
-    let jasaTemplate = '';
-    if (services.length > 0) {
-        jasaTemplate = `🧰 *Jasa Pengerjaan* ${this.diskonSettings.jasa > 0 ? `(Diskon ${this.diskonSettings.jasa}%)` : ''}\n\n`;
+                services.forEach(service => {
+                    const hargaNormal = (service.price || 0) * (service.hour || 1);
+                    const hargaDiskon = hargaNormal * (1 - this.diskonSettings.jasa / 100);
 
-        services.forEach(service => {
-            const hargaNormal = (service.price || 0) * (service.hour || 1);
-            const hargaDiskon = hargaNormal * (1 - this.diskonSettings.jasa / 100);
+                    if (this.diskonSettings.jasa > 0) {
+                        jasaTemplate += `• ${service.name || 'Jasa'}\n`;
+                        jasaTemplate += `  Rp ${hargaNormal.toLocaleString('id-ID')} → Rp ${Math.round(hargaDiskon).toLocaleString('id-ID')}\n\n`;
+                    } else {
+                        jasaTemplate += `• ${service.name || 'Jasa'}\n`;
+                        jasaTemplate += `  Rp ${hargaNormal.toLocaleString('id-ID')}\n\n`;
+                    }
+                });
 
-            if (this.diskonSettings.jasa > 0) {
-                jasaTemplate += `• ${service.name || 'Jasa'}\n`;
-                jasaTemplate += `  Rp ${hargaNormal.toLocaleString('id-ID')} → Rp ${Math.round(hargaDiskon).toLocaleString('id-ID')}\n\n`;
-            } else {
-                jasaTemplate += `• ${service.name || 'Jasa'}\n`;
-                jasaTemplate += `  Rp ${hargaNormal.toLocaleString('id-ID')}\n\n`;
+                // Total jasa
+                if (this.diskonSettings.jasa > 0) {
+                    jasaTemplate += `*Total Jasa:*\n`;
+                    jasaTemplate += `Rp ${totalServiceNormal.toLocaleString('id-ID')} → Rp ${Math.round(totalServiceDiskon).toLocaleString('id-ID')}\n\n`;
+                } else {
+                    jasaTemplate += `*Total Jasa:* Rp ${totalServiceNormal.toLocaleString('id-ID')}\n\n`;
+                }
             }
-        });
 
-        // Total jasa
-        if (this.diskonSettings.jasa > 0) {
-            jasaTemplate += `*Total Jasa:*\n`;
-            jasaTemplate += `Rp ${totalServiceNormal.toLocaleString('id-ID')} → Rp ${Math.round(totalServiceDiskon).toLocaleString('id-ID')}\n\n`;
-        } else {
-            jasaTemplate += `*Total Jasa:* Rp ${totalServiceNormal.toLocaleString('id-ID')}\n\n`;
-        }
-    }
-
-    // Template akhir
-    let template = `Halo ${panggilan} ${estimasi.name_customer ? '👋🙂' : '👋'}
+            // Template akhir
+            let template = `Halo ${panggilan} ${estimasi.name_customer ? '👋🙂' : '👋'}
 
 Terkait kedatangan servis ${hariLalu}, berikut estimasi untuk ${estimasi.jenis_mobil || ''} ${estimasi.nopol || ''} ${estimasi.nomor_rangka ? `(Nomor rangka: ${estimasi.nomor_rangka})` : ''}:
 
@@ -2210,27 +2322,27 @@ tunas TOYOTA Batu Tulis 🚗✨`;
             return template.replace(/\n/g, '<br>');
         }
 
-// Method untuk menghitung hari lalu
-hitungHariLalu(tanggal) {
-    if (!tanggal) return 'beberapa hari lalu';
+        // Method untuk menghitung hari lalu
+        hitungHariLalu(tanggal) {
+            if (!tanggal) return 'beberapa hari lalu';
 
-    const createdDate = new Date(tanggal);
-    const today = new Date();
-    const diffTime = Math.abs(today - createdDate);
-    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+            const createdDate = new Date(tanggal);
+            const today = new Date();
+            const diffTime = Math.abs(today - createdDate);
+            const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
 
-    if (diffDays === 1) return '1 hari lalu';
-    if (diffDays === 2) return '2 hari lalu';
-    return `${diffDays} hari lalu`;
-}
+            if (diffDays === 1) return '1 hari lalu';
+            if (diffDays === 2) return '2 hari lalu';
+            return `${diffDays} hari lalu`;
+        }
 
-renderSparepartSelection(estimasi) {
-    const spareparts = this.parseSpareparts(estimasi);
-    if (spareparts.length === 0) return '';
+        renderSparepartSelection(estimasi) {
+            const spareparts = this.parseSpareparts(estimasi);
+            if (spareparts.length === 0) return '';
 
-    const selectedSpareparts = estimasi.mra_selected_spareparts || [];
+            const selectedSpareparts = estimasi.mra_selected_spareparts || [];
 
-    return `
+            return `
                 <div style="margin-bottom: 12px;">
                     <label style="display: block; margin-bottom: 6px; font-size: 14px; font-weight: 500;">Sparepart yang Disetujui</label>
                     <div style="max-height: 120px; overflow-y: auto; border: 1px solid #ddd; border-radius: 6px; padding: 12px; background: white;">
@@ -2248,336 +2360,336 @@ renderSparepartSelection(estimasi) {
             `;
         }
 
-parseSpareparts(estimasi) {
-    if (!estimasi.sparepart_data) return [];
-    try {
-        const spareparts = typeof estimasi.sparepart_data === 'string'
-        ? JSON.parse(estimasi.sparepart_data)
-        : estimasi.sparepart_data;
-        return Array.isArray(spareparts) ? spareparts : [];
-    } catch (e) {
-        return [];
-    }
-}
-
-parseServices(estimasi) {
-    if (!estimasi.service_data) return [];
-    try {
-        const services = typeof estimasi.service_data === 'string'
-        ? JSON.parse(estimasi.service_data)
-        : estimasi.service_data;
-        return Array.isArray(services) ? services : [];
-    } catch (e) {
-        return [];
-    }
-}
-
-calculateTotalAfterDiscount(estimasi) {
-    const spareparts = this.parseSpareparts(estimasi);
-    const services = this.parseServices(estimasi);
-
-    let totalSparepart = 0;
-    let totalService = 0;
-
-    spareparts.forEach(part => {
-        totalSparepart += (part.price || 0) * (part.qty || 1);
-    });
-
-    services.forEach(service => {
-        totalService += (service.price || 0) * (service.hour || 1);
-    });
-
-    // Gunakan diskonSettings yang terupdate
-    const sparepartAfterDiscount = totalSparepart * (1 - this.diskonSettings.sparepart / 100);
-    const serviceAfterDiscount = totalService * (1 - this.diskonSettings.jasa / 100);
-
-    return Math.round(sparepartAfterDiscount + serviceAfterDiscount);
-}
-
-formatPhoneDisplay(phoneData) {
-    if (!phoneData) return '-';
-    const phoneRegex = /(\d{10,})|(\(\d{10,}\))/g;
-    const matches = phoneData.match(phoneRegex);
-    if (!matches || matches.length === 0) return '-';
-    const firstPhone = matches[0].replace(/[\(\)]/g, '');
-    return this.truncateText(firstPhone, 12);
-}
-
-truncateText(text, maxLength) {
-    if (!text) return '-';
-    if (text.length <= maxLength) return text;
-    return text.substring(0, maxLength) + '...';
-}
-
-getMRAStatusBadge(status) {
-    const statusConfig = {
-        'pending': { color: '#ff9800', text: 'Pending' },
-        'contacted': { color: '#2196f3', text: 'Dihubungi' },
-        'interested': { color: '#4caf50', text: 'Tertarik' },
-        'not_interested': { color: '#f44336', text: 'Tidak Tertarik' },
-        'accepted': { color: '#2e7d32', text: 'ACC' }
-    };
-
-    const config = statusConfig[status] || { color: '#666', text: 'Belum' };
-    return `<span style="background: ${config.color}; color: white; padding: 4px 8px; border-radius: 10px; font-size: 12px; display: inline-block;">${config.text}</span>`;
-}
-attachNotAcceptEvents() {
-    // Row selection
-    document.querySelectorAll('#table-body-not-accept tr').forEach(row => {
-        row.addEventListener('click', () => {
-            document.querySelectorAll('#table-body-not-accept tr').forEach(r => {
-                r.style.background = 'transparent';
-            });
-            row.style.background = '#e3f2fd';
-
-            const estimasiId = row.getAttribute('data-id');
-            this.selectedId = estimasiId;
-            this.currentDetail = this.estimasiData.find(e => e.id === estimasiId);
-            currentEstimasiId = estimasiId;
-            this.customerDetail = null;
-            this.renderCurrentTab();
-        });
-    });
-
-    // Search functionality - PERBAIKAN: Gunakan event input yang lebih responsif
-    const searchInput = document.getElementById('search-not-accept');
-    if (searchInput) {
-        // Clear previous event listeners
-        searchInput.oninput = null;
-        searchInput.onkeyup = null;
-
-        searchInput.addEventListener('input', (e) => {
-            this.filterNotAcceptData(e.target.value);
-        });
-
-        // Tambahkan juga event keyup untuk handle clear (X) button
-        searchInput.addEventListener('keyup', (e) => {
-            if (e.key === 'Escape') {
-                searchInput.value = '';
-                this.filterNotAcceptData('');
+        parseSpareparts(estimasi) {
+            if (!estimasi.sparepart_data) return [];
+            try {
+                const spareparts = typeof estimasi.sparepart_data === 'string'
+                ? JSON.parse(estimasi.sparepart_data)
+                : estimasi.sparepart_data;
+                return Array.isArray(spareparts) ? spareparts : [];
+            } catch (e) {
+                return [];
             }
-        });
-    }
+        }
 
-    // Date filter - PERBAIKAN: Handle change dan input event
-    const dateFilter = document.getElementById('date-filter-not-accept');
-    if (dateFilter) {
-        // Set default value ke tanggal 1 bulan ini
-        const today = new Date();
-        const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
-        dateFilter.value = firstDay.toISOString().split('T')[0];
+        parseServices(estimasi) {
+            if (!estimasi.service_data) return [];
+            try {
+                const services = typeof estimasi.service_data === 'string'
+                ? JSON.parse(estimasi.service_data)
+                : estimasi.service_data;
+                return Array.isArray(services) ? services : [];
+            } catch (e) {
+                return [];
+            }
+        }
 
-        dateFilter.addEventListener('change', () => {
-            this.filterNotAcceptByDate(dateFilter.value);
-        });
+        calculateTotalAfterDiscount(estimasi) {
+            const spareparts = this.parseSpareparts(estimasi);
+            const services = this.parseServices(estimasi);
 
-        dateFilter.addEventListener('input', () => {
-            this.filterNotAcceptByDate(dateFilter.value);
-        });
-    }
+            let totalSparepart = 0;
+            let totalService = 0;
 
-    // HANYA GUNAKAN DISKON DARI PANEL KIRI (Detail Customer & Estimasi)
-    const discSparepartMid = document.getElementById('disc-sparepart-mid');
-    const discJasaMid = document.getElementById('disc-jasa-mid');
+            spareparts.forEach(part => {
+                totalSparepart += (part.price || 0) * (part.qty || 1);
+            });
 
-    const updateDiskonSettings = () => {
-        this.diskonSettings.sparepart = parseInt(discSparepartMid?.value) || 0;
-        this.diskonSettings.jasa = parseInt(discJasaMid?.value) || 0;
-        this.renderCurrentTab(); // Render ulang semua tab termasuk template WhatsApp
-    };
+            services.forEach(service => {
+                totalService += (service.price || 0) * (service.hour || 1);
+            });
 
-    if (discSparepartMid) {
-        discSparepartMid.addEventListener('change', updateDiskonSettings);
-        discSparepartMid.addEventListener('input', updateDiskonSettings);
-    }
-    if (discJasaMid) {
-        discJasaMid.addEventListener('change', updateDiskonSettings);
-        discJasaMid.addEventListener('input', updateDiskonSettings);
-    }
+            // Gunakan diskonSettings yang terupdate
+            const sparepartAfterDiscount = totalSparepart * (1 - this.diskonSettings.sparepart / 100);
+            const serviceAfterDiscount = totalService * (1 - this.diskonSettings.jasa / 100);
 
-    // Event untuk navigasi foto
-    this.attachFotoEvents();
+            return Math.round(sparepartAfterDiscount + serviceAfterDiscount);
+        }
 
-    // Button events
-    this.attachButtonEvents();
-}
+        formatPhoneDisplay(phoneData) {
+            if (!phoneData) return '-';
+            const phoneRegex = /(\d{10,})|(\(\d{10,}\))/g;
+            const matches = phoneData.match(phoneRegex);
+            if (!matches || matches.length === 0) return '-';
+            const firstPhone = matches[0].replace(/[\(\)]/g, '');
+            return this.truncateText(firstPhone, 12);
+        }
 
-attachButtonEvents() {
-    // Event untuk tombol template
-    setTimeout(() => {
-        document.querySelectorAll('.template-btn').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                const templateType = e.target.getAttribute('data-template');
+        truncateText(text, maxLength) {
+            if (!text) return '-';
+            if (text.length <= maxLength) return text;
+            return text.substring(0, maxLength) + '...';
+        }
 
-                // Update tampilan template di kotak teks
-                this.updateTemplateDisplay(templateType);
+        getMRAStatusBadge(status) {
+            const statusConfig = {
+                'pending': { color: '#ff9800', text: 'Pending' },
+                'contacted': { color: '#2196f3', text: 'Dihubungi' },
+                'interested': { color: '#4caf50', text: 'Tertarik' },
+                'not_interested': { color: '#f44336', text: 'Tidak Tertarik' },
+                'accepted': { color: '#2e7d32', text: 'ACC' }
+            };
 
-                // Highlight tombol yang aktif
-                document.querySelectorAll('.template-btn').forEach(b => {
-                    b.style.background = '#e3f2fd';
-                    b.style.color = '#1976d2';
-                    b.style.border = '1px solid #bbdefb';
-                    b.classList.remove('active');
+            const config = statusConfig[status] || { color: '#666', text: 'Belum' };
+            return `<span style="background: ${config.color}; color: white; padding: 4px 8px; border-radius: 10px; font-size: 12px; display: inline-block;">${config.text}</span>`;
+        }
+        attachNotAcceptEvents() {
+            // Row selection
+            document.querySelectorAll('#table-body-not-accept tr').forEach(row => {
+                row.addEventListener('click', () => {
+                    document.querySelectorAll('#table-body-not-accept tr').forEach(r => {
+                        r.style.background = 'transparent';
+                    });
+                    row.style.background = '#e3f2fd';
+
+                    const estimasiId = row.getAttribute('data-id');
+                    this.selectedId = estimasiId;
+                    this.currentDetail = this.estimasiData.find(e => e.id === estimasiId);
+                    currentEstimasiId = estimasiId;
+                    this.customerDetail = null;
+                    this.renderCurrentTab();
+                });
+            });
+
+            // Search functionality - PERBAIKAN: Gunakan event input yang lebih responsif
+            const searchInput = document.getElementById('search-not-accept');
+            if (searchInput) {
+                // Clear previous event listeners
+                searchInput.oninput = null;
+                searchInput.onkeyup = null;
+
+                searchInput.addEventListener('input', (e) => {
+                    this.filterNotAcceptData(e.target.value);
                 });
 
-                e.target.style.background = '#1976d2';
-                e.target.style.color = 'white';
-                e.target.style.border = '1px solid #1976d2';
-                e.target.classList.add('active');
-
-                // Simpan template yang dipilih
-                this.selectedTemplateType = templateType;
-            });
-        });
-    }, 100);
-
-    // Update event untuk kirim WhatsApp agar menggunakan template yang dipilih
-    const sendWhatsAppTemplate = document.getElementById('send-whatsapp-template');
-    if (sendWhatsAppTemplate) {
-        sendWhatsAppTemplate.addEventListener('click', () => {
-            const templateType = this.selectedTemplateType || 'formal_ramah';
-            this.openWhatsAppWithTemplate(templateType);
-        });
-    }
-
-    // Update event untuk copy template
-    const copyTemplateBottom = document.getElementById('copy-template-bottom');
-    if (copyTemplateBottom) {
-        copyTemplateBottom.addEventListener('click', () => {
-            const templateType = this.selectedTemplateType || 'formal_ramah';
-            this.copyTemplateToClipboard(templateType);
-        });
-    }
-    // Check Work Order (dummy)
-    // Di dalam method attachButtonEvents(), GANTI bagian ini:
-    const checkWorkorder = document.getElementById('check-workorder');
-    if (checkWorkorder) {
-        checkWorkorder.addEventListener('click', () => {
-            // GANTI dari notifikasi "dalam pengembangan" menjadi:
-            this.checkWorkOrder();
-        });
-    }
-
-    // Di dalam method attachButtonEvents(), TAMBAHKAN:
-    // Event untuk tombol template
-    document.querySelectorAll('.template-btn').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-            const templateType = e.target.getAttribute('data-template');
-
-            // Update tampilan template
-            const templateContainer = document.querySelector('#detail-content-right .template-display');
-            if (templateContainer && this.currentDetail) {
-                templateContainer.innerHTML = this.generateWhatsAppTemplateByType(this.currentDetail, templateType);
+                // Tambahkan juga event keyup untuk handle clear (X) button
+                searchInput.addEventListener('keyup', (e) => {
+                    if (e.key === 'Escape') {
+                        searchInput.value = '';
+                        this.filterNotAcceptData('');
+                    }
+                });
             }
 
-            // Highlight tombol yang aktif
-            document.querySelectorAll('.template-btn').forEach(b => {
-                b.style.background = '';
-                b.style.color = '';
-                b.style.border = '1px solid #ddd';
+            // Date filter - PERBAIKAN: Handle change dan input event
+            const dateFilter = document.getElementById('date-filter-not-accept');
+            if (dateFilter) {
+                // Set default value ke tanggal 1 bulan ini
+                const today = new Date();
+                const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
+                dateFilter.value = firstDay.toISOString().split('T')[0];
+
+                dateFilter.addEventListener('change', () => {
+                    this.filterNotAcceptByDate(dateFilter.value);
+                });
+
+                dateFilter.addEventListener('input', () => {
+                    this.filterNotAcceptByDate(dateFilter.value);
+                });
+            }
+
+            // HANYA GUNAKAN DISKON DARI PANEL KIRI (Detail Customer & Estimasi)
+            const discSparepartMid = document.getElementById('disc-sparepart-mid');
+            const discJasaMid = document.getElementById('disc-jasa-mid');
+
+            const updateDiskonSettings = () => {
+                this.diskonSettings.sparepart = parseInt(discSparepartMid?.value) || 0;
+                this.diskonSettings.jasa = parseInt(discJasaMid?.value) || 0;
+                this.renderCurrentTab(); // Render ulang semua tab termasuk template WhatsApp
+            };
+
+            if (discSparepartMid) {
+                discSparepartMid.addEventListener('change', updateDiskonSettings);
+                discSparepartMid.addEventListener('input', updateDiskonSettings);
+            }
+            if (discJasaMid) {
+                discJasaMid.addEventListener('change', updateDiskonSettings);
+                discJasaMid.addEventListener('input', updateDiskonSettings);
+            }
+
+            // Event untuk navigasi foto
+            this.attachFotoEvents();
+
+            // Button events
+            this.attachButtonEvents();
+        }
+
+        attachButtonEvents() {
+            // Event untuk tombol template
+            setTimeout(() => {
+                document.querySelectorAll('.template-btn').forEach(btn => {
+                    btn.addEventListener('click', (e) => {
+                        const templateType = e.target.getAttribute('data-template');
+
+                        // Update tampilan template di kotak teks
+                        this.updateTemplateDisplay(templateType);
+
+                        // Highlight tombol yang aktif
+                        document.querySelectorAll('.template-btn').forEach(b => {
+                            b.style.background = '#e3f2fd';
+                            b.style.color = '#1976d2';
+                            b.style.border = '1px solid #bbdefb';
+                            b.classList.remove('active');
+                        });
+
+                        e.target.style.background = '#1976d2';
+                        e.target.style.color = 'white';
+                        e.target.style.border = '1px solid #1976d2';
+                        e.target.classList.add('active');
+
+                        // Simpan template yang dipilih
+                        this.selectedTemplateType = templateType;
+                    });
+                });
+            }, 100);
+
+            // Update event untuk kirim WhatsApp agar menggunakan template yang dipilih
+            const sendWhatsAppTemplate = document.getElementById('send-whatsapp-template');
+            if (sendWhatsAppTemplate) {
+                sendWhatsAppTemplate.addEventListener('click', () => {
+                    const templateType = this.selectedTemplateType || 'formal_ramah';
+                    this.openWhatsAppWithTemplate(templateType);
+                });
+            }
+
+            // Update event untuk copy template
+            const copyTemplateBottom = document.getElementById('copy-template-bottom');
+            if (copyTemplateBottom) {
+                copyTemplateBottom.addEventListener('click', () => {
+                    const templateType = this.selectedTemplateType || 'formal_ramah';
+                    this.copyTemplateToClipboard(templateType);
+                });
+            }
+            // Check Work Order (dummy)
+            // Di dalam method attachButtonEvents(), GANTI bagian ini:
+            const checkWorkorder = document.getElementById('check-workorder');
+            if (checkWorkorder) {
+                checkWorkorder.addEventListener('click', () => {
+                    // GANTI dari notifikasi "dalam pengembangan" menjadi:
+                    this.checkWorkOrder();
+                });
+            }
+
+            // Di dalam method attachButtonEvents(), TAMBAHKAN:
+            // Event untuk tombol template
+            document.querySelectorAll('.template-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    const templateType = e.target.getAttribute('data-template');
+
+                    // Update tampilan template
+                    const templateContainer = document.querySelector('#detail-content-right .template-display');
+                    if (templateContainer && this.currentDetail) {
+                        templateContainer.innerHTML = this.generateWhatsAppTemplateByType(this.currentDetail, templateType);
+                    }
+
+                    // Highlight tombol yang aktif
+                    document.querySelectorAll('.template-btn').forEach(b => {
+                        b.style.background = '';
+                        b.style.color = '';
+                        b.style.border = '1px solid #ddd';
+                    });
+
+                    e.target.style.background = '#1976d2';
+                    e.target.style.color = 'white';
+                    e.target.style.border = '1px solid #1976d2';
+
+                    // Simpan template yang dipilih
+                    this.selectedTemplateType = templateType;
+                });
             });
 
-            e.target.style.background = '#1976d2';
-            e.target.style.color = 'white';
-            e.target.style.border = '1px solid #1976d2';
+            // Di dalam method attachButtonEvents(), GANTI bagian ini:
+            const syncCrm = document.getElementById('sync-crm');
+            if (syncCrm) {
+                syncCrm.addEventListener('click', () => {
+                    // GANTI dari notifikasi "dalam pengembangan" menjadi:
+                    this.syncWithCRM5();
+                });
+            }
 
-            // Simpan template yang dipilih
-            this.selectedTemplateType = templateType;
-        });
-    });
+            // Download PDF
+            const downloadPdf = document.getElementById('download-pdf');
+            if (downloadPdf) {
+                downloadPdf.addEventListener('click', () => {
+                    if (this.currentDetail) {
+                        generatePdfA5();
+                    } else {
+                        this.showNotification('Pilih estimasi terlebih dahulu', 'warning');
+                    }
+                });
+            }
 
-    // Di dalam method attachButtonEvents(), GANTI bagian ini:
-    const syncCrm = document.getElementById('sync-crm');
-    if (syncCrm) {
-        syncCrm.addEventListener('click', () => {
-            // GANTI dari notifikasi "dalam pengembangan" menjadi:
-            this.syncWithCRM5();
-        });
-    }
+            // Send WhatsApp Main
+            const sendWhatsAppMain = document.getElementById('send-whatsapp-main');
+            if (sendWhatsAppMain) {
+                sendWhatsAppMain.addEventListener('click', () => {
+                    this.openWhatsAppWithTemplate();
+                });
+            }
 
-    // Download PDF
-    const downloadPdf = document.getElementById('download-pdf');
-    if (downloadPdf) {
-        downloadPdf.addEventListener('click', () => {
-            if (this.currentDetail) {
-                generatePdfA5();
-            } else {
+            setTimeout(() => {
+                document.querySelectorAll('.template-btn').forEach(btn => {
+                    btn.addEventListener('click', (e) => {
+                        const templateType = e.target.getAttribute('data-template');
+
+                        // Update tampilan template di kotak teks
+                        this.updateTemplateDisplay(templateType);
+
+                        // Highlight tombol yang aktif
+                        document.querySelectorAll('.template-btn').forEach(b => {
+                            b.style.background = '#e3f2fd';
+                            b.style.color = '#1976d2';
+                            b.style.border = '1px solid #bbdefb';
+                            b.classList.remove('active');
+                        });
+
+                        e.target.style.background = '#1976d2';
+                        e.target.style.color = 'white';
+                        e.target.style.border = '1px solid #1976d2';
+                        e.target.classList.add('active');
+
+                        // Simpan template yang dipilih
+                        this.selectedTemplateType = templateType;
+                    });
+                });
+
+                // Event untuk tombol edit masing-masing template
+                document.querySelectorAll('.edit-template-btn').forEach(btn => {
+                    btn.addEventListener('click', (e) => {
+                        e.stopPropagation(); // Mencegah trigger event parent
+                        const templateType = e.target.closest('.edit-template-btn').getAttribute('data-template');
+                        this.openTemplateEditor(templateType);
+                    });
+                });
+            }, 100);
+
+            // Copy Template
+            const copyTemplate = document.getElementById('copy-template');
+            if (copyTemplate) {
+                copyTemplate.addEventListener('click', () => {
+                    this.copyTemplateToClipboard();
+                });
+            }
+
+            // Follow-up form
+            const followUpForm = document.getElementById('follow-up-form');
+            if (followUpForm) {
+                followUpForm.addEventListener('submit', (e) => {
+                    e.preventDefault();
+                    this.saveFollowUp();
+                });
+            }
+        }
+        openTemplateEditor(templateType = 'formal_ramah') {
+            if (!this.currentDetail) {
                 this.showNotification('Pilih estimasi terlebih dahulu', 'warning');
+                return;
             }
-        });
-    }
 
-    // Send WhatsApp Main
-    const sendWhatsAppMain = document.getElementById('send-whatsapp-main');
-    if (sendWhatsAppMain) {
-        sendWhatsAppMain.addEventListener('click', () => {
-            this.openWhatsAppWithTemplate();
-        });
-    }
+            // Gunakan template yang dipilih atau template default
+            const currentTemplate = this.generateWhatsAppTemplateByType(this.currentDetail, templateType).replace(/<br>/g, '\n');
 
-    setTimeout(() => {
-        document.querySelectorAll('.template-btn').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                const templateType = e.target.getAttribute('data-template');
-
-                // Update tampilan template di kotak teks
-                this.updateTemplateDisplay(templateType);
-
-                // Highlight tombol yang aktif
-                document.querySelectorAll('.template-btn').forEach(b => {
-                    b.style.background = '#e3f2fd';
-                    b.style.color = '#1976d2';
-                    b.style.border = '1px solid #bbdefb';
-                    b.classList.remove('active');
-                });
-
-                e.target.style.background = '#1976d2';
-                e.target.style.color = 'white';
-                e.target.style.border = '1px solid #1976d2';
-                e.target.classList.add('active');
-
-                // Simpan template yang dipilih
-                this.selectedTemplateType = templateType;
-            });
-        });
-
-        // Event untuk tombol edit masing-masing template
-        document.querySelectorAll('.edit-template-btn').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                e.stopPropagation(); // Mencegah trigger event parent
-                const templateType = e.target.closest('.edit-template-btn').getAttribute('data-template');
-                this.openTemplateEditor(templateType);
-            });
-        });
-    }, 100);
-
-    // Copy Template
-    const copyTemplate = document.getElementById('copy-template');
-    if (copyTemplate) {
-        copyTemplate.addEventListener('click', () => {
-            this.copyTemplateToClipboard();
-        });
-    }
-
-    // Follow-up form
-    const followUpForm = document.getElementById('follow-up-form');
-    if (followUpForm) {
-        followUpForm.addEventListener('submit', (e) => {
-            e.preventDefault();
-            this.saveFollowUp();
-        });
-    }
-}
-openTemplateEditor(templateType = 'formal_ramah') {
-    if (!this.currentDetail) {
-        this.showNotification('Pilih estimasi terlebih dahulu', 'warning');
-        return;
-    }
-
-    // Gunakan template yang dipilih atau template default
-    const currentTemplate = this.generateWhatsAppTemplateByType(this.currentDetail, templateType).replace(/<br>/g, '\n');
-
-    const editorHtml = `
+            const editorHtml = `
         <div style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 1000;">
             <div style="background: white; padding: 25px; border-radius: 10px; width: 600px; max-width: 90%; max-height: 90vh; overflow-y: auto;">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
@@ -2660,202 +2772,201 @@ openTemplateEditor(templateType = 'formal_ramah') {
             });
         }
 
-// Method helper untuk mendapatkan nama display template
-getTemplateDisplayName(templateType) {
-    const names = {
-        'formal_ramah': 'Formal Ramah',
-        'sangat_formal': 'Sangat Formal',
-        'formal_bersahabat': 'Formal Bersahabat',
-        'singkat_padat': 'Singkat & Padat',
-        'elegan_customer': 'Elegan & Customer-Oriented'
-    };
-    return names[templateType] || templateType;
-}
+        // Method helper untuk mendapatkan nama display template
+        getTemplateDisplayName(templateType) {
+            const names = {
+                'inti_estimasi': 'Inti Estimasi',
+                'daftar_harga': 'Daftar Harga',
+                'respon_tidak_tertarik': 'Tidak Tertarik',
+                'respon_tertarik': 'Respon Tertarik'
+            };
+            return names[templateType] || templateType;
+        }
 
-// Method untuk menyimpan template custom (simpan di localStorage)
-saveCustomTemplate(templateType, templateContent) {
-    const customTemplates = JSON.parse(localStorage.getItem('mra_custom_templates') || '{}');
-    customTemplates[templateType] = templateContent;
-    localStorage.setItem('mra_custom_templates', JSON.stringify(customTemplates));
-}
+        // Method untuk menyimpan template custom (simpan di localStorage)
+        saveCustomTemplate(templateType, templateContent) {
+            const customTemplates = JSON.parse(localStorage.getItem('mra_custom_templates') || '{}');
+            customTemplates[templateType] = templateContent;
+            localStorage.setItem('mra_custom_templates', JSON.stringify(customTemplates));
+        }
 
-// Method untuk memuat template custom
-loadCustomTemplate(templateType) {
-    const customTemplates = JSON.parse(localStorage.getItem('mra_custom_templates') || '{}');
-    return customTemplates[templateType] || null;
-}
+        // Method untuk memuat template custom
+        loadCustomTemplate(templateType) {
+            const customTemplates = JSON.parse(localStorage.getItem('mra_custom_templates') || '{}');
+            return customTemplates[templateType] || null;
+        }
 
-// Method helper untuk mendapatkan nama display template
-getTemplateDisplayName(templateType) {
-    const names = {
-        'formal_ramah': 'Formal Ramah',
-        'sangat_formal': 'Sangat Formal',
-        'formal_bersahabat': 'Formal Bersahabat',
-        'singkat_padat': 'Singkat & Padat',
-        'elegan_customer': 'Elegan & Customer-Oriented'
-    };
-    return names[templateType] || templateType;
-}
+        // Method helper untuk mendapatkan nama display template
+        getTemplateDisplayName(templateType) {
+            const names = {
+                'formal_ramah': 'Formal Ramah',
+                'sangat_formal': 'Sangat Formal',
+                'formal_bersahabat': 'Formal Bersahabat',
+                'singkat_padat': 'Singkat & Padat',
+                'elegan_customer': 'Elegan & Customer-Oriented'
+            };
+            return names[templateType] || templateType;
+        }
 
-// Method untuk menyimpan template custom (simpan di localStorage)
-saveCustomTemplate(templateType, templateContent) {
-    const customTemplates = JSON.parse(localStorage.getItem('mra_custom_templates') || '{}');
-    customTemplates[templateType] = templateContent;
-    localStorage.setItem('mra_custom_templates', JSON.stringify(customTemplates));
-}
+        // Method untuk menyimpan template custom (simpan di localStorage)
+        saveCustomTemplate(templateType, templateContent) {
+            const customTemplates = JSON.parse(localStorage.getItem('mra_custom_templates') || '{}');
+            customTemplates[templateType] = templateContent;
+            localStorage.setItem('mra_custom_templates', JSON.stringify(customTemplates));
+        }
 
-// Method untuk memuat template custom
-loadCustomTemplate(templateType) {
-    const customTemplates = JSON.parse(localStorage.getItem('mra_custom_templates') || '{}');
-    return customTemplates[templateType] || null;
-}
+        // Method untuk memuat template custom
+        loadCustomTemplate(templateType) {
+            const customTemplates = JSON.parse(localStorage.getItem('mra_custom_templates') || '{}');
+            return customTemplates[templateType] || null;
+        }
 
-wrapSelectedText(textarea, wrapper) {
-    const start = textarea.selectionStart;
-    const end = textarea.selectionEnd;
-    const selectedText = textarea.value.substring(start, end);
-    const newText = textarea.value.substring(0, start) + wrapper + selectedText + wrapper + textarea.value.substring(end);
-    textarea.value = newText;
-    textarea.focus();
-    textarea.setSelectionRange(start + wrapper.length, end + wrapper.length);
-}
+        wrapSelectedText(textarea, wrapper) {
+            const start = textarea.selectionStart;
+            const end = textarea.selectionEnd;
+            const selectedText = textarea.value.substring(start, end);
+            const newText = textarea.value.substring(0, start) + wrapper + selectedText + wrapper + textarea.value.substring(end);
+            textarea.value = newText;
+            textarea.focus();
+            textarea.setSelectionRange(start + wrapper.length, end + wrapper.length);
+        }
 
-openWhatsAppWithTemplate(templateType = 'formal_ramah') {
-    if (!this.currentDetail) {
-        this.showNotification('Pilih estimasi terlebih dahulu', 'warning');
-        return;
-    }
-
-    const phoneNumbers = this.extractPhoneNumbers(this.currentDetail.telepon_customer);
-    if (phoneNumbers.length === 0) {
-        this.showNotification('Tidak ada nomor telepon yang valid', 'error');
-        return;
-    }
-
-    const message = this.generateWhatsAppTemplateByType(this.currentDetail, templateType).replace(/<br>/g, '\n');
-    const phone = phoneNumbers[0];
-    this.sendWhatsApp(phone, message);
-}
-
-copyTemplateToClipboard(templateType = 'formal_ramah') {
-    if (!this.currentDetail) {
-        this.showNotification('Pilih estimasi terlebih dahulu', 'warning');
-        return;
-    }
-
-    const template = this.generateWhatsAppTemplateByType(this.currentDetail, templateType).replace(/<br>/g, '\n');
-    navigator.clipboard.writeText(template).then(() => {
-        this.showNotification('Template berhasil disalin!', 'success');
-    });
-}
-
-sendWhatsApp(phone, message) {
-    const encodedMessage = encodeURIComponent(message);
-    const whatsappUrl = `https://wa.me/${phone}?text=${encodedMessage}`;
-    window.open(whatsappUrl, '_blank');
-}
-
-extractPhoneNumbers(phoneData) {
-    if (!phoneData) return [];
-    const phoneNumbers = [];
-    const phoneRegex = /(\d{10,})|(\(\d{10,}\))/g;
-    const matches = phoneData.match(phoneRegex);
-    if (matches) {
-        matches.forEach(match => {
-            let cleanNumber = match.replace(/[\(\)]/g, '');
-            if (cleanNumber.startsWith('0')) {
-                cleanNumber = '62' + cleanNumber.substring(1);
-            } else if (cleanNumber.startsWith('8')) {
-                cleanNumber = '62' + cleanNumber;
+        openWhatsAppWithTemplate(templateType = 'inti_estimasi') {
+            if (!this.currentDetail) {
+                this.showNotification('Pilih estimasi terlebih dahulu', 'warning');
+                return;
             }
-            phoneNumbers.push(cleanNumber);
-        });
-    }
-    return phoneNumbers;
-}
 
-async saveFollowUp() {
-    if (!this.currentDetail) return;
+            const phoneNumbers = this.extractPhoneNumbers(this.currentDetail.telepon_customer);
+            if (phoneNumbers.length === 0) {
+                this.showNotification('Tidak ada nomor telepon yang valid', 'error');
+                return;
+            }
 
-    try {
-        const form = document.getElementById('follow-up-form');
-        const formData = new FormData(form);
+            const message = this.generateWhatsAppTemplateByType(this.currentDetail, templateType).replace(/<br>/g, '\n');
+            const phone = phoneNumbers[0];
+            this.sendWhatsApp(phone, message);
+        }
 
-        const selectedSpareparts = [];
-        formData.getAll('mra_selected_spareparts').forEach(index => {
-            selectedSpareparts.push(parseInt(index));
-        });
+        copyTemplateToClipboard(templateType = 'inti_estimasi') {
+            if (!this.currentDetail) {
+                this.showNotification('Pilih estimasi terlebih dahulu', 'warning');
+                return;
+            }
 
-        const updateData = {
-            mra_status: formData.get('mra_status'),
-            mra_catatan: formData.get('mra_catatan'),
-            mra_selected_spareparts: selectedSpareparts,
-            updated_at: new Date().toISOString()
-        };
+            const template = this.generateWhatsAppTemplateByType(this.currentDetail, templateType).replace(/<br>/g, '\n');
+            navigator.clipboard.writeText(template).then(() => {
+                this.showNotification('Template berhasil disalin!', 'success');
+            });
+        }
 
-        const { error } = await supabase
-        .from('estimasi')
-        .update(updateData)
-        .eq('id', this.currentDetail.id);
+        sendWhatsApp(phone, message) {
+            const encodedMessage = encodeURIComponent(message);
+            const whatsappUrl = `https://wa.me/${phone}?text=${encodedMessage}`;
+            window.open(whatsappUrl, '_blank');
+        }
 
-        if (error) throw error;
+        extractPhoneNumbers(phoneData) {
+            if (!phoneData) return [];
+            const phoneNumbers = [];
+            const phoneRegex = /(\d{10,})|(\(\d{10,}\))/g;
+            const matches = phoneData.match(phoneRegex);
+            if (matches) {
+                matches.forEach(match => {
+                    let cleanNumber = match.replace(/[\(\)]/g, '');
+                    if (cleanNumber.startsWith('0')) {
+                        cleanNumber = '62' + cleanNumber.substring(1);
+                    } else if (cleanNumber.startsWith('8')) {
+                        cleanNumber = '62' + cleanNumber;
+                    }
+                    phoneNumbers.push(cleanNumber);
+                });
+            }
+            return phoneNumbers;
+        }
 
-        this.showNotification('Follow-up berhasil disimpan!', 'success');
-        await this.loadData();
+        async saveFollowUp() {
+            if (!this.currentDetail) return;
 
-    } catch (error) {
-        console.error('Error saving follow-up:', error);
-        this.showNotification('Error saving follow-up: ' + error.message, 'error');
-    }
-}
+            try {
+                const form = document.getElementById('follow-up-form');
+                const formData = new FormData(form);
 
-filterNotAcceptData(searchTerm) {
-    // Filter hanya data dengan status 'completed'
-    const filtered = this.estimasiData.filter(estimasi =>
-                                              estimasi.status === 'completed'
-                                             );
+                const selectedSpareparts = [];
+                formData.getAll('mra_selected_spareparts').forEach(index => {
+                    selectedSpareparts.push(parseInt(index));
+                });
 
-    if (!searchTerm || searchTerm.trim() === '') {
-        this.filteredData = filtered;
-    } else {
-        const term = searchTerm.toLowerCase().trim();
-        this.filteredData = filtered.filter(estimasi =>
-                                            (estimasi.nopol && estimasi.nopol.toLowerCase().includes(term)) ||
-                                            (estimasi.name_customer && estimasi.name_customer.toLowerCase().includes(term)) ||
-                                            (estimasi.jenis_mobil && estimasi.jenis_mobil.toLowerCase().includes(term)) ||
-                                            (estimasi.nomor_rangka && estimasi.nomor_rangka.toLowerCase().includes(term))
-                                           );
-    }
+                const updateData = {
+                    mra_status: formData.get('mra_status'),
+                    mra_catatan: formData.get('mra_catatan'),
+                    mra_selected_spareparts: selectedSpareparts,
+                    updated_at: new Date().toISOString()
+                };
 
-    this.renderCurrentTab();
-}
+                const { error } = await supabase
+                .from('estimasi')
+                .update(updateData)
+                .eq('id', this.currentDetail.id);
 
-filterNotAcceptByDate(date) {
-    const filtered = this.estimasiData.filter(estimasi =>
-                                              estimasi.status === 'completed'
-                                             );
+                if (error) throw error;
 
-    if (!date) {
-        this.filteredData = filtered;
-    } else {
-        const filterDate = new Date(date);
-        filterDate.setHours(0, 0, 0, 0); // Set ke awal hari
+                this.showNotification('Follow-up berhasil disimpan!', 'success');
+                await this.loadData();
 
-        this.filteredData = filtered.filter(estimasi => {
-            const estimasiDate = new Date(estimasi.created_at);
-            estimasiDate.setHours(0, 0, 0, 0); // Set ke awal hari
-            return estimasiDate >= filterDate;
-        });
-    }
+            } catch (error) {
+                console.error('Error saving follow-up:', error);
+                this.showNotification('Error saving follow-up: ' + error.message, 'error');
+            }
+        }
 
-    this.renderCurrentTab();
-}
+        filterNotAcceptData(searchTerm) {
+            // Filter hanya data dengan status 'completed'
+            const filtered = this.estimasiData.filter(estimasi =>
+                                                      estimasi.status === 'completed'
+                                                     );
 
-// ... (methods untuk tab lainnya tetap sama)
+            if (!searchTerm || searchTerm.trim() === '') {
+                this.filteredData = filtered;
+            } else {
+                const term = searchTerm.toLowerCase().trim();
+                this.filteredData = filtered.filter(estimasi =>
+                                                    (estimasi.nopol && estimasi.nopol.toLowerCase().includes(term)) ||
+                                                    (estimasi.name_customer && estimasi.name_customer.toLowerCase().includes(term)) ||
+                                                    (estimasi.jenis_mobil && estimasi.jenis_mobil.toLowerCase().includes(term)) ||
+                                                    (estimasi.nomor_rangka && estimasi.nomor_rangka.toLowerCase().includes(term))
+                                                   );
+            }
 
-showNotification(message, type = 'info') {
-    const notification = document.createElement('div');
-    notification.style.cssText = `
+            this.renderCurrentTab();
+        }
+
+        filterNotAcceptByDate(date) {
+            const filtered = this.estimasiData.filter(estimasi =>
+                                                      estimasi.status === 'completed'
+                                                     );
+
+            if (!date) {
+                this.filteredData = filtered;
+            } else {
+                const filterDate = new Date(date);
+                filterDate.setHours(0, 0, 0, 0); // Set ke awal hari
+
+                this.filteredData = filtered.filter(estimasi => {
+                    const estimasiDate = new Date(estimasi.created_at);
+                    estimasiDate.setHours(0, 0, 0, 0); // Set ke awal hari
+                    return estimasiDate >= filterDate;
+                });
+            }
+
+            this.renderCurrentTab();
+        }
+
+        // ... (methods untuk tab lainnya tetap sama)
+
+        showNotification(message, type = 'info') {
+            const notification = document.createElement('div');
+            notification.style.cssText = `
                 position: fixed;
                 top: 20px;
                 right: 20px;
@@ -2892,231 +3003,706 @@ showNotification(message, type = 'info') {
                 }, 300);
             }, 3000);
         }
-}
-
-// PDF Generation Functions
-async function generatePdfA5(format = 'A5') {
-    if (!currentEstimasiId) {
-        alert('Pilih estimasi terlebih dahulu');
-        return;
     }
 
-    try {
-        const { data, error } = await supabase
-        .from('estimasi')
-        .select('*')
-        .eq('id', currentEstimasiId)
-        .single();
+    // Fungsi untuk convert URL ke base64
+    function getBase64FromUrl(url) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: url,
+                responseType: 'arraybuffer',
+                onload: function(response) {
+                    const base64 = btoa(
+                        new Uint8Array(response.response)
+                        .reduce((data, byte) => data + String.fromCharCode(byte), '')
+                    );
+                    resolve('data:image/png;base64,' + base64);
+                },
+                onerror: function(error) {
+                    reject(error);
+                }
+            });
+        });
+    }
 
-        if (error) throw error;
+    // Fungsi untuk mendapatkan nomor WhatsApp
+    function getWhatsAppNumber(serviceAdvisor) {
+        try {
+            const advisorName = String(serviceAdvisor || 'Yuliansari').trim();
 
-        // Ambil data teknisi
-        let teknisiNama = '-';
-        if (data.teknisi_id) {
-            const { data: userData, error: userError } = await supabase
-            .from('users')
-            .select('full_name')
-            .eq('id', data.teknisi_id)
+            const whatsappNumbers = {
+                'Abdul Azis': '087889077123',
+                'Akbarudin': '085899345191',
+                'Muhammad Hakiki': '081806274120',
+                'Ade Purwanto': '081999704850',
+                'Ahmad Baidowi': '081999704850'
+            };
+
+            let number = whatsappNumbers[advisorName];
+
+            if (!number) {
+                const keys = Object.keys(whatsappNumbers);
+                const foundKey = keys.find(key =>
+                                           advisorName.toLowerCase().includes(key.toLowerCase()) ||
+                                           key.toLowerCase().includes(advisorName.toLowerCase())
+                                          );
+                number = foundKey ? whatsappNumbers[foundKey] : '087821885317';
+            }
+
+            if (typeof number !== 'string') {
+                number = String(number);
+            }
+
+            number = number.replace(/\D/g, '');
+            return number || '081315389866';
+
+        } catch (error) {
+            console.error('Error in getWhatsAppNumber:', error);
+            return '081315389866';
+        }
+    }
+
+    // Fungsi helper untuk parse komponen
+    function parseKomponen(komponenData) {
+        if (!komponenData) return [];
+
+        try {
+            if (typeof komponenData === 'string') {
+                // Coba parse sebagai JSON
+                try {
+                    const parsed = JSON.parse(komponenData);
+                    return Array.isArray(parsed) ? parsed : [komponenData];
+                } catch (e) {
+                    // Jika bukan JSON, split by comma
+                    return komponenData.split(',').map(k => k.trim()).filter(k => k.length > 0);
+                }
+            } else if (Array.isArray(komponenData)) {
+                return komponenData;
+            }
+        } catch (e) {
+            logDebug('Error parsing komponen data:', e, 'error');
+        }
+
+        return [];
+    }
+
+    // FUNGSI HELPER UNTUK CELL DENGAN CORETAN
+    function cell(text, isAcc) {
+        if (isAcc) {
+            return {
+                text: text,
+                decoration: "lineThrough",
+                color: "#777"
+            };
+        }
+        return { text: text };
+    }
+
+    async function generatePdfA5(format = 'A5') {
+        try {
+            if (!currentEstimasiId) {
+                alert('Tidak ada data estimasi yang dipilih');
+                return;
+            }
+
+            const { data, error } = await supabase
+            .from('estimasi')
+            .select('*')
+            .eq('id', currentEstimasiId)
             .single();
 
-            if (!userError && userData) {
-                teknisiNama = userData.full_name || '-';
-            }
-        }
+            if (error) throw error;
 
-        // Handle sparepart
-        let sparepartData = [];
-        let totalHargaSparepart = 0;
-        if (data.sparepart_data) {
-            if (Array.isArray(data.sparepart_data)) {
-                sparepartData = data.sparepart_data;
-            } else if (typeof data.sparepart_data === 'string') {
-                try {
-                    sparepartData = JSON.parse(data.sparepart_data);
-                    if (!Array.isArray(sparepartData)) sparepartData = [];
-                } catch (e) {
-                    sparepartData = [];
+            // Ambil data teknisi
+            let teknisiNama = '-';
+            if (data.teknisi_id) {
+                const { data: userData, error: userError } = await supabase
+                .from('users')
+                .select('full_name')
+                .eq('id', data.teknisi_id)
+                .single();
+
+                if (!userError && userData) {
+                    teknisiNama = userData.full_name || '-';
                 }
             }
 
-            // Hitung total harga sparepart
-            if (sparepartData.length > 0) {
-                totalHargaSparepart = sparepartData.reduce((total, item) => {
-                    const itemTotal = parseFloat(item.total || item.subtotal || 0);
-                    return total + itemTotal;
-                }, 0);
-            }
-        }
+            // Ambil data sparepart yang sudah di-ACC
+            const selectedSpareparts = parseKomponen(data.mra_selected_spareparts || []);
 
-        // Handle service data
-        let serviceData = [];
-        let totalHargaService = 0;
-        if (data.service_data) {
-            if (Array.isArray(data.service_data)) {
-                serviceData = data.service_data;
-            } else if (typeof data.service_data === 'string') {
-                try {
-                    serviceData = JSON.parse(data.service_data);
-                    if (!Array.isArray(serviceData)) serviceData = [];
-                } catch (e) {
-                    serviceData = [];
+            // Ambil setting diskon dari dashboard (gunakan dari app instance)
+            const diskonSparepart = window.app?.diskonSettings?.sparepart || 0;
+            const diskonJasa = window.app?.diskonSettings?.jasa || 0;
+
+            // Handle sparepart dengan perhitungan total yang benar
+            let sparepartData = [];
+            let totalHargaSparepartNormal = 0;
+            let totalHargaSparepartDiskon = 0;
+            let totalHargaSparepartNonAcc = 0;
+
+            if (data.sparepart_data) {
+                if (Array.isArray(data.sparepart_data)) {
+                    sparepartData = data.sparepart_data;
+                } else if (typeof data.sparepart_data === 'string') {
+                    try {
+                        sparepartData = JSON.parse(data.sparepart_data);
+                        if (!Array.isArray(sparepartData)) sparepartData = [];
+                    } catch (e) {
+                        sparepartData = [];
+                    }
+                }
+
+                // Hitung total harga sparepart
+                if (sparepartData.length > 0) {
+                    sparepartData.forEach(item => {
+                        const itemTotal = parseFloat(item.total || item.subtotal || 0);
+
+                        // PERBAIKAN: SAMAKAN FORMAT STRING UNTUK PERBANDINGAN
+                        const isAccCompleted = selectedSpareparts
+                        .map(s => s.toLowerCase().trim())
+                        .includes((item.name || "").toLowerCase().trim());
+
+                        if (!isAccCompleted) {
+                            totalHargaSparepartNormal += itemTotal;
+                        }
+                    });
+
+                    // Hitung diskon sparepart
+                    totalHargaSparepartDiskon = totalHargaSparepartNormal * (1 - diskonSparepart / 100);
+                    totalHargaSparepartNonAcc = Math.round(totalHargaSparepartDiskon);
                 }
             }
 
-            // Hitung total harga service
-            if (serviceData.length > 0) {
-                totalHargaService = serviceData.reduce((total, service) => {
-                    const serviceTotal = parseFloat(service.total || service.subtotal || 0);
-                    return total + serviceTotal;
-                }, 0);
+            // Handle service data
+            let serviceData = [];
+            let totalHargaServiceNormal = 0;
+            let totalHargaServiceDiskon = 0;
+
+            if (data.service_data) {
+                if (Array.isArray(data.service_data)) {
+                    serviceData = data.service_data;
+                } else if (typeof data.service_data === 'string') {
+                    try {
+                        serviceData = JSON.parse(data.service_data);
+                        if (!Array.isArray(serviceData)) serviceData = [];
+                    } catch (e) {
+                        serviceData = [];
+                    }
+                }
+
+                // Hitung total harga service
+                if (serviceData.length > 0) {
+                    totalHargaServiceNormal = serviceData.reduce((total, service) => {
+                        const serviceTotal = parseFloat(service.total || service.subtotal || 0);
+                        return total + serviceTotal;
+                    }, 0);
+
+                    // Hitung diskon jasa
+                    totalHargaServiceDiskon = totalHargaServiceNormal * (1 - diskonJasa / 100);
+                }
             }
-        }
 
-        // Hitung total harga keseluruhan
-        const totalHargaKeseluruhan = totalHargaSparepart + totalHargaService;
+            // Hitung total harga keseluruhan setelah diskon
+            const totalHargaKeseluruhan = Math.round(totalHargaSparepartDiskon + totalHargaServiceDiskon);
+            const totalDiskonSparepart = totalHargaSparepartNormal - totalHargaSparepartDiskon;
+            const totalDiskonJasa = totalHargaServiceNormal - totalHargaServiceDiskon;
+            const totalDiskonKeseluruhan = totalDiskonSparepart + totalDiskonJasa;
 
-        // Siapkan content PDF
-        const content = [
-            { text: 'Estimasi Saran Perbaikan', alignment: 'center', fontSize: 14, margin: [0, 0, 0, 15] },
+            // Hitung margin/untung (contoh: 20% dari harga setelah diskon)
+            const marginPersen = 20; // Anda bisa ubah persentase margin
+            const totalBiayaPokok = totalHargaKeseluruhan * 0.8; // Asumsi 80% cost, 20% margin
+            const totalUntung = totalHargaKeseluruhan - totalBiayaPokok;
 
-            { text: `Nomor Polisi: ${data.nopol}`, fontSize: 12, margin: [0, 0, 0, 4] },
-            { text: `Nomor Rangka: ${data.nomor_rangka || '-'}`, fontSize: 12, margin: [0, 0, 0, 4] },
-            { text: `Nama Teknisi: ${teknisiNama}`, fontSize: 12, margin: [0, 0, 0, 4] },
-            { text: `Tanggal Estimasi: ${new Date(data.created_at).toLocaleDateString('id-ID')}`, fontSize: 12, margin: [0, 0, 0, 15] }
-        ];
-
-        // Tambahkan tabel sparepart jika ada data
-        if (sparepartData.length > 0) {
-            content.push({
-                table: {
-                    widths: ['*', 'auto', 'auto', 'auto', 'auto'],
-                    body: [
-                        [
-                            { text: 'Nama Barang', fillColor: '#e60000', color: 'white', bold: true },
-                            { text: 'Harga', fillColor: '#e60000', color: 'white', bold: true },
-                            { text: 'Jml', fillColor: '#e60000', color: 'white', bold: true },
-                            { text: 'Total', fillColor: '#e60000', color: 'white', bold: true },
-                            { text: 'Part', fillColor: '#e60000', color: 'white', bold: true }
-                        ],
-                        ...sparepartData.map(item => {
-                            let avail = '-';
-                            if (item.availability) {
-                                const val = item.availability.toLowerCase();
-                                if (val === 'ada') avail = 'Ada';
-                                else if (val === 'kosong') avail = 'Kosong';
-                                else if (val === 'bo') avail = 'BO';
-                                else if (val === 'tam') avail = 'TAM';
+            // Handle foto URL (tetap sama seperti sebelumnya)
+            let fotoArray = [];
+            let fotoImages = [];
+            if (data.foto_url) {
+                try {
+                    if (typeof data.foto_url === 'string') {
+                        try {
+                            const parsed = JSON.parse(data.foto_url);
+                            fotoArray = Array.isArray(parsed) ? parsed : [];
+                        } catch (e) {
+                            if (data.foto_url.includes('[') && data.foto_url.includes(']')) {
+                                const cleanString = data.foto_url.replace(/\\/g, '').replace(/"/g, '"');
+                                try {
+                                    const reparsed = JSON.parse(cleanString);
+                                    fotoArray = Array.isArray(reparsed) ? reparsed : [data.foto_url];
+                                } catch (e2) {
+                                    fotoArray = [data.foto_url];
+                                }
+                            } else {
+                                fotoArray = [data.foto_url];
                             }
-                            return [
-                                truncateText(item.name, 25) || '-',
-                                formatRupiah(item.price || 0),
-                                item.qty || 1,
-                                formatRupiah(item.total || item.subtotal || 0),
-                                avail
-                            ];
-                        }),
-                        [
-                            { text: 'Total Harga Sparepart', colSpan: 3, alignment: 'right', bold: true }, {}, {},
-                            { text: formatRupiah(totalHargaSparepart), bold: true },
-                            ''
-                        ]
-                    ]
-                },
-                fontSize: 10,
-                margin: [0, 0, 0, 15]
-            });
-        }
+                        }
+                    } else if (Array.isArray(data.foto_url)) {
+                        fotoArray = data.foto_url;
+                    }
 
-        // Tambahkan tabel service jika ada data
-        if (serviceData.length > 0) {
-            content.push({
-                table: {
-                    widths: ['*', 'auto', 'auto', 'auto'],
-                    body: [
-                        [
-                            { text: 'Jenis Service', fillColor: '#2196F3', color: 'white', bold: true },
-                            { text: 'Jam', fillColor: '#2196F3', color: 'white', bold: true },
-                            { text: 'Harga/Jam', fillColor: '#2196F3', color: 'white', bold: true },
-                            { text: 'Total', fillColor: '#2196F3', color: 'white', bold: true }
-                        ],
-                        ...serviceData.map(service => {
-                            return [
-                                truncateText(service.name || '-', 30),
-                                service.hour || service.jam || 0,
-                                formatRupiah(service.price || service.harga || 0),
-                                formatRupiah(service.total || service.subtotal || 0)
-                            ];
-                        }),
-                        [
-                            { text: 'Total Harga Service', colSpan: 3, alignment: 'right', bold: true }, {}, {},
-                            { text: formatRupiah(totalHargaService), bold: true }
-                        ]
-                    ]
-                },
-                fontSize: 10,
-                margin: [0, 0, 0, 15]
-            });
-        }
+                    // Convert foto URLs ke base64 untuk PDF
+                    if (fotoArray.length > 0) {
+                        for (const fotoUrl of fotoArray) {
+                            try {
+                                if (fotoUrl && typeof fotoUrl === 'string' && fotoUrl.startsWith('http')) {
+                                    const base64Image = await getBase64FromUrl(fotoUrl);
+                                    fotoImages.push(base64Image);
+                                }
+                            } catch (error) {
+                                console.error('Error converting image to base64:', error, 'URL:', fotoUrl);
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.error('Error parsing foto_url:', e);
+                    fotoArray = [];
+                }
+            }
 
-        // Tambahkan total harga keseluruhan
-        if (sparepartData.length > 0 || serviceData.length > 0) {
+            // Dapatkan nomor WhatsApp berdasarkan Service Advisor
+            const serviceAdvisor = data.service_advisor || 'Abdul Azis';
+            const whatsappNumber = getWhatsAppNumber(serviceAdvisor);
+
+            // QR admin dan icons
+            const qrBase64 = await getBase64FromUrl(
+                "https://pjawwektzazcxakgopou.supabase.co/storage/v1/object/public/static/qrcode.png"
+            );
+
+            const whatsappIcon = await getBase64FromUrl(
+                "https://pjawwektzazcxakgopou.supabase.co/storage/v1/object/public/static/whatsapp.png"
+            );
+
+            const tunasLogo = await getBase64FromUrl(
+                "https://pjawwektzazcxakgopou.supabase.co/storage/v1/object/public/static/tunas.png"
+            );
+
+            // Siapkan content PDF
+            const content = [
+                { text: 'Estimasi Saran Perbaikan', alignment: 'center', fontSize: 12, margin: [0, 0, 0, 12] },
+
+                { text: `Nomor Polisi: ${data.nopol}`, fontSize: 10, margin: [0, 0, 0, 3] },
+                { text: `Nomor Rangka: ${data.nomor_rangka || '-'}`, fontSize: 10, margin: [0, 0, 0, 3] },
+                { text: `Nama Teknisi: ${teknisiNama}`, fontSize: 10, margin: [0, 0, 0, 3] },
+                { text: `Tanggal Estimasi: ${new Date(data.created_at).toLocaleDateString('id-ID')}`, fontSize: 10, margin: [0, 0, 0, 12] }
+            ];
+
+            // TAMPILKAN INFORMASI DISKON JIKA ADA
+            if (diskonSparepart > 0 || diskonJasa > 0) {
+                content.push({
+                    text: 'INFORMASI DISKON:',
+                    fontSize: 9,
+                    bold: true,
+                    margin: [0, 0, 0, 5],
+                    color: '#e60000'
+                });
+
+                if (diskonSparepart > 0) {
+                    content.push({
+                        text: `Diskon Sparepart: ${diskonSparepart}%`,
+                        fontSize: 8,
+                        margin: [0, 0, 0, 2]
+                    });
+                }
+
+                if (diskonJasa > 0) {
+                    content.push({
+                        text: `Diskon Jasa: ${diskonJasa}%`,
+                        fontSize: 8,
+                        margin: [0, 0, 0, 2]
+                    });
+                }
+
+                content.push({ text: '', margin: [0, 0, 0, 8] });
+            }
+
+            // INFORMASI KOMPONEN YANG SUDAH DI-ACC
+            if (selectedSpareparts.length > 0) {
+                content.push({
+                    text: 'KOMPONEN YANG SUDAH DISETUJUI:',
+                    fontSize: 9,
+                    bold: true,
+                    margin: [0, 0, 0, 5],
+                    color: '#e60000'
+                });
+
+                content.push({
+                    text: selectedSpareparts.join(', '),
+                    fontSize: 8,
+                    margin: [0, 0, 0, 10]
+                });
+            }
+
+            // Tambahkan tabel sparepart jika ada data
+            if (sparepartData.length > 0) {
+                const sparepartBody = [
+                    [
+                        { text: 'Nama Barang', fillColor: '#e60000', color: 'white', bold: true },
+                        { text: 'Harga', fillColor: '#e60000', color: 'white', bold: true },
+                        { text: 'Jml', fillColor: '#e60000', color: 'white', bold: true },
+                        { text: 'Total', fillColor: '#e60000', color: 'white', bold: true },
+                        { text: 'Part', fillColor: '#e60000', color: 'white', bold: true }
+                    ]
+                ];
+
+                // Tambahkan baris data sparepart DENGAN FUNGSI CELL HELPER
+                sparepartData.forEach(item => {
+                    let avail = '-';
+                    if (item.availability) {
+                        const val = item.availability.toLowerCase();
+                        if (val === 'ada') avail = 'Ada';
+                        else if (val === 'kosong') avail = 'Kosong';
+                        else if (val === 'bo') avail = 'BO';
+                        else if (val === 'tam') avail = 'TAM';
+                    }
+
+                    // PERBAIKAN: SAMAKAN FORMAT STRING UNTUK PERBANDINGAN
+                    const isAccCompleted = selectedSpareparts
+                    .map(s => s.toLowerCase().trim())
+                    .includes((item.name || "").toLowerCase().trim());
+
+                    // GUNAKAN FUNGSI CELL HELPER UNTUK SETIAP CELL
+                    sparepartBody.push([
+                        cell(truncateText(item.name, 25) || '-', isAccCompleted),
+                        cell(formatRupiah(item.price || 0), isAccCompleted),
+                        cell(item.qty || 1, isAccCompleted),
+                        cell(formatRupiah(item.total || item.subtotal || 0), isAccCompleted),
+                        cell(avail, isAccCompleted)
+                    ]);
+                });
+
+                // Baris total sparepart NORMAL
+                sparepartBody.push([
+                    { text: 'Total Harga Sparepart (Normal)', colSpan: 3, alignment: 'right', bold: true }, {}, {},
+                    { text: formatRupiah(totalHargaSparepartNormal), bold: true },
+                    ''
+                ]);
+
+                // Baris diskon sparepart jika ada
+                if (diskonSparepart > 0) {
+                    sparepartBody.push([
+                        { text: `Diskon Sparepart (${diskonSparepart}%)`, colSpan: 3, alignment: 'right', color: '#e60000' }, {}, {},
+                        { text: `- ${formatRupiah(totalDiskonSparepart)}`, color: '#e60000' },
+                        ''
+                    ]);
+
+                    // Baris total sparepart setelah diskon
+                    sparepartBody.push([
+                        { text: 'Total Harga Sparepart (Setelah Diskon)', colSpan: 3, alignment: 'right', bold: true, color: '#2e7d32' }, {}, {},
+                        { text: formatRupiah(totalHargaSparepartDiskon), bold: true, color: '#2e7d32' },
+                        ''
+                    ]);
+                } else {
+                    // Jika tidak ada diskon, tampilkan total normal saja
+                    sparepartBody.push([
+                        { text: 'Total Harga Sparepart', colSpan: 3, alignment: 'right', bold: true }, {}, {},
+                        { text: formatRupiah(totalHargaSparepartNormal), bold: true },
+                        ''
+                    ]);
+                }
+
+                content.push({
+                    table: {
+                        widths: ['*', 'auto', 'auto', 'auto', 'auto'],
+                        body: sparepartBody
+                    },
+                    fontSize: 9,
+                    margin: [0, 0, 0, 12]
+                });
+            }
+
+            // Tambahkan tabel service jika ada data
+            if (serviceData.length > 0) {
+                const serviceBody = [
+                    [
+                        { text: 'Jenis Service', fillColor: '#2196F3', color: 'white', bold: true },
+                        { text: 'Jam', fillColor: '#2196F3', color: 'white', bold: true },
+                        { text: 'Harga/Jam', fillColor: '#2196F3', color: 'white', bold: true },
+                        { text: 'Total', fillColor: '#2196F3', color: 'white', bold: true }
+                    ]
+                ];
+
+                serviceBody.push(...serviceData.map(service => {
+                    return [
+                        { text: truncateText(service.desc || '-', 30) },
+                        { text: service.hour || service.jam || 0 },
+                        { text: formatRupiah(service.price || service.harga || 0) },
+                        { text: formatRupiah(service.total || service.subtotal || 0) }
+                    ];
+                }));
+
+                // Baris total service NORMAL
+                serviceBody.push([
+                    { text: 'Total Harga Service (Normal)', colSpan: 3, alignment: 'right', bold: true }, {}, {},
+                    { text: formatRupiah(totalHargaServiceNormal), bold: true }
+                ]);
+
+                // Baris diskon jasa jika ada
+                if (diskonJasa > 0) {
+                    serviceBody.push([
+                        { text: `Diskon Jasa (${diskonJasa}%)`, colSpan: 3, alignment: 'right', color: '#4caf50' }, {}, {},
+                        { text: `- ${formatRupiah(totalDiskonJasa)}`, color: '#4caf50' }
+                    ]);
+
+                    // Baris total service setelah diskon
+                    serviceBody.push([
+                        { text: 'Total Harga Service (Setelah Diskon)', colSpan: 3, alignment: 'right', bold: true, color: '#2e7d32' }, {}, {},
+                        { text: formatRupiah(totalHargaServiceDiskon), bold: true, color: '#2e7d32' }
+                    ]);
+                } else {
+                    // Jika tidak ada diskon, tampilkan total normal saja
+                    serviceBody.push([
+                        { text: 'Total Harga Service', colSpan: 3, alignment: 'right', bold: true }, {}, {},
+                        { text: formatRupiah(totalHargaServiceNormal), bold: true }
+                    ]);
+                }
+
+                content.push({
+                    table: {
+                        widths: ['*', 'auto', 'auto', 'auto'],
+                        body: serviceBody
+                    },
+                    fontSize: 9,
+                    margin: [0, 0, 0, 12]
+                });
+            }
+
+            // Tambahkan RINGKASAN FINAL dengan perhitungan untung
+            const ringkasanBody = [];
+
+            // Total normal
+            ringkasanBody.push([
+                { text: 'Total Harga Normal', alignment: 'right', bold: true },
+                { text: formatRupiah(totalHargaSparepartNormal + totalHargaServiceNormal), bold: true }
+            ]);
+
+            // Diskon jika ada
+            if (totalDiskonKeseluruhan > 0) {
+                ringkasanBody.push([
+                    { text: 'Total Diskon', alignment: 'right', color: '#e60000' },
+                    { text: `- ${formatRupiah(totalDiskonKeseluruhan)}`, color: '#e60000' } //#4caf50
+                ]);
+            }
+
+            // Total setelah diskon
+            ringkasanBody.push([
+                { text: 'TOTAL HARGA SETELAH DISKON', alignment: 'right', bold: true, fontSize: 11 },
+                { text: formatRupiah(totalHargaKeseluruhan), bold: true, fontSize: 11, color: '#4caf50' } //#e60000
+            ]);
+
             content.push({
                 table: {
                     widths: ['*', 'auto'],
-                    body: [
-                        [
-                            { text: 'TOTAL HARGA KESELURUHAN', alignment: 'right', bold: true, fontSize: 12 },
-                            { text: formatRupiah(totalHargaKeseluruhan), bold: true, fontSize: 12, color: '#e60000' }
-                        ]
+                    body: ringkasanBody
+                },
+                margin: [0, 0, 0, 12]
+            });
+
+            // Tambahkan gambar jika ada (tetap sama)
+            if (fotoImages.length > 0) {
+                content.push({
+                    text: 'Foto Estimasi:',
+                    fontSize: 10,
+                    bold: true,
+                    margin: [0, 10, 0, 5]
+                });
+
+                const fotoPerBaris = 3;
+                const rows = [];
+
+                for (let i = 0; i < fotoImages.length; i += fotoPerBaris) {
+                    const rowImages = fotoImages.slice(i, i + fotoPerBaris);
+                    const columns = rowImages.map(img => ({
+                        image: img,
+                        fit: [180, 145],
+                        alignment: 'center',
+                        margin: [2, 0, 2, 0]
+                    }));
+
+                    while (columns.length < fotoPerBaris) {
+                        columns.push({ text: '', width: '*' });
+                    }
+
+                    rows.push({
+                        columns: columns,
+                        columnGap: 6,
+                        margin: [0, 0, 0, 6]
+                    });
+                }
+
+                content.push(...rows);
+                content.push({ text: '', margin: [0, 0, 0, 10] });
+            }
+
+            // Tambahkan keterangan dan footer notes
+            const notes = [
+                { text: '*Harga dapat berubah sewaktu-waktu tanpa pemberitahuan', fontSize: 8, italics: true, margin: [0, 0, 0, 2] },
+                { text: '*Ada (Dapat dilakukan penggantian), TAM (Order 3 hari), BO (Order 1 bulan), Kosong (berhenti produksi)', fontSize: 8, italics: true, margin: [0, 0, 0, 2] }
+            ];
+
+            // Tambahan informasi tentang perhitungan harga
+            if (selectedSpareparts.length > 0) {
+                notes.push(
+                    {
+                        text: '*Item bergaris coret adalah komponen yang sudah disetujui dan tidak termasuk dalam total harga',
+                        fontSize: 8,
+                        italics: true,
+                        margin: [0, 0, 0, 2],
+                        color: '#e60000'
+                    }
+                );
+            }
+
+            // Tambahkan info diskon di notes jika ada
+            if (diskonSparepart > 0 || diskonJasa > 0) {
+                notes.push({
+                    text: `*Perhitungan sudah termasuk diskon sparepart ${diskonSparepart}% dan diskon jasa ${diskonJasa}%`,
+                    fontSize: 8,
+                    italics: true,
+                    margin: [0, 8, 0, 0],
+                    color: '#4caf50'
+                });
+            }
+
+            notes.push({
+                text: `Keterangan: ${data.keterangan || 'Tidak ada keterangan tambahan'}`,
+                fontSize: 10,
+                margin: [0, 8, 0, 0]
+            });
+
+            content.push(...notes);
+
+            // Sisanya sama seperti sebelumnya...
+            const docDefinition = {
+                pageSize: 'A5',
+                pageMargins: [20, 80, 20, 80],
+
+                header: {
+                    margin: [20, 20, 20, 10],
+                    stack: [
+                        {
+                            columns: [
+                                {
+                                    width: 'auto',
+                                    image: tunasLogo,
+                                    fit: [25, 25],
+                                    margin: [0, 0, 8, 0]
+                                },
+                                {
+                                    width: '*',
+                                    stack: [
+                                        { text: 'Tunas Toyota Batutulis', fontSize: 14, bold: true, color: '#e60000' },
+                                        { text: 'Jl. Batutulis Raya No. 42, Jakarta Pusat', fontSize: 10 },
+                                        { text: 'Telp: (021) 3454465', fontSize: 9 }
+                                    ],
+                                    alignment: 'left'
+                                }
+                            ]
+                        },
+                        {
+                            margin: [0, 8, 0, 0],
+                            canvas: [
+                                { type: 'line', x1: 0, y1: 0, x2: 400, y2: 0, lineWidth: 1, color: '#e60000' }
+                            ]
+                        }
                     ]
                 },
-                margin: [0, 0, 0, 15]
-            });
+
+                footer: function (currentPage, pageCount) {
+                    const advisorName = data.service_advisor || 'Abdul Azis';
+                    const whatsappNum = getWhatsAppNumber(advisorName);
+
+                    return {
+                        margin: [20, 10, 20, 10],
+                        stack: [
+                            {
+                                columns: [
+                                    {
+                                        width: '*',
+                                        stack: [
+                                            {
+                                                text: `Hubungi ${advisorName} untuk melakukan perbaikan:`,
+                                                bold: true,
+                                                fontSize: 10
+                                            },
+                                            {
+                                                margin: [0, 2, 0, 0],
+                                                columns: [
+                                                    {
+                                                        width: 12,
+                                                        image: whatsappIcon,
+                                                        fit: [10, 10],
+                                                        margin: [0, 0, 6, 0]
+                                                    },
+                                                    {
+                                                        width: '*',
+                                                        text: whatsappNum,
+                                                        fontSize: 10,
+                                                        color: '#25D366'
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                text: `Service Advisor Tunas Toyota Batutulis`,
+                                                fontSize: 8,
+                                                color: '#666',
+                                                margin: [0, 4, 0, 0]
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        width: 60,
+                                        image: qrBase64,
+                                        fit: [50, 50]
+                                    }
+                                ]
+                            },
+                            {
+                                margin: [0, 5, 0, 0],
+                                columns: [
+                                    {
+                                        width: '*',
+                                        text: `Dicetak pada: ${new Date().toLocaleDateString('id-ID')} ${new Date().toLocaleTimeString('id-ID')}`,
+                                        fontSize: 8,
+                                        color: '#6c757d',
+                                        alignment: 'left'
+                                    },
+                                    {
+                                        width: 50,
+                                        text: currentPage.toString() + ' / ' + pageCount,
+                                        fontSize: 8,
+                                        alignment: 'right'
+                                    }
+                                ]
+                            }
+                        ]
+                    };
+                },
+
+                content: content
+            };
+
+            // Download PDF
+            pdfMake.createPdf(docDefinition).download(`estimasi_${data.nopol}_${new Date().getTime()}.pdf`);
+
+        } catch (error) {
+            console.error('Error generating PDF:', error);
+            alert('Terjadi kesalahan saat membuat PDF: ' + error.message);
         }
-
-        const docDefinition = {
-            pageSize: 'A5',
-            pageMargins: [20, 60, 20, 60],
-            content: content,
-            header: {
-                text: 'Tunas Toyota Batutulis',
-                alignment: 'center',
-                margin: [0, 20, 0, 0],
-                fontSize: 16,
-                bold: true,
-                color: '#e60000'
-            },
-            footer: function(currentPage, pageCount) {
-                return {
-                    text: `Halaman ${currentPage} dari ${pageCount}`,
-                    alignment: 'center',
-                    margin: [0, 20, 0, 0],
-                    fontSize: 9
-                };
-            }
-        };
-
-        pdfMake.createPdf(docDefinition).download(`estimasi_${data.nopol}_${new Date().getTime()}.pdf`);
-
-    } catch (error) {
-        console.error('Error generating PDF:', error);
-        alert('Terjadi kesalahan saat membuat PDF: ' + error.message);
     }
-}
+    //latest
+    function formatRupiah(amount) {
+        return 'Rp ' + parseInt(amount).toLocaleString('id-ID');
+    }
 
-function formatRupiah(amount) {
-    return 'Rp ' + parseInt(amount).toLocaleString('id-ID');
-}
+    function truncateText(text, maxLength) {
+        if (!text) return '';
+        if (text.length <= maxLength) return text;
+        return text.substring(0, maxLength) + '...';
+    }
 
-function truncateText(text, maxLength) {
-    if (!text) return '';
-    if (text.length <= maxLength) return text;
-    return text.substring(0, maxLength) + '...';
-}
-
-// Add CSS styles
-const style = document.createElement('style');
-style.textContent = `
+    // Add CSS styles
+    const style = document.createElement('style');
+    style.textContent = `
      /* CSS untuk scroll horizontal foto - FIXED WIDTH */
     .foto-container-wrapper {
         position: relative;
