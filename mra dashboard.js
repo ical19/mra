@@ -10,6 +10,8 @@
 // @grant        GM_getValue
 // @connect      tunastoyota.crm5.dynamics.com
 // @connect      pjawwektzazcxakgopou.supabase.co
+// @connect      cloudinary.com
+// @connect      res.cloudinary.com
 // @require      https://cdn.jsdelivr.net/npm/chart.js
 // @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
 // @require      https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js
@@ -33,21 +35,36 @@
         constructor() {
             this.currentTab = 'estimasi-not-accept';
             this.estimasiData = [];
-            this.filteredData = []; // Pastikan ini ada
+            this.filteredData = [];
             this.sortConfig = { key: null, direction: 'asc' };
             this.currentDetail = null;
             this.selectedId = null;
             this.itemsPerPage = 25;
             this.currentPage = 1;
             this.customerDetail = null;
+            this.accRenderPending = false;
+            this.searchState = {
+                term: '',
+                date: '',
+                showAll: true // ✅ BARU: flag untuk tampilkan semua data
+            };
+            this.originalData = []; // ✅ BARU: simpan data asli
+
+            // Set tanggal default
+            const today = new Date();
+            const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
+            this.searchState.date = firstDay.toISOString().split('T')[0];
+
             this.diskonSettings = {
                 sparepart: 0,
                 jasa: 0,
-                manualSparepart: {}, // { index: persentase }
-                manualJasa: {} // { index: persentase }
+                manualSparepart: {},
+                manualJasa: {}
             };
             this.selectedTemplateType = 'inti_estimasi';
             window.app = this;
+
+            console.log('🔄 MRAFollowUpApp initialized'); // Debug log
             this.init();
         }
 
@@ -56,6 +73,9 @@
             await this.authenticateUser();
             this.createUI();
             await this.loadData();
+
+            this.attachGlobalEvents();
+
         }
 
         async initializeSupabase() {
@@ -88,6 +108,101 @@
             }
         }
 
+        attachGlobalEvents() {
+            // Download PDF event - DIPERBAIKI
+            document.addEventListener('click', (e) => {
+                const target = e.target;
+
+                // Handle download PDF
+                if (target.id === 'download-pdf' || target.closest('#download-pdf')) {
+                    e.preventDefault();
+                    if (this.currentDetail) {
+                        this.downloadPDFHandler();
+                    } else {
+                        this.showNotification('Pilih estimasi terlebih dahulu', 'warning');
+                    }
+                    return;
+                }
+
+                // Sync CRM event
+                if (target.id === 'sync-crm' || target.closest('#sync-crm')) {
+                    e.preventDefault();
+                    this.syncWithCRM5();
+                    return;
+                }
+
+                // Check Work Order event
+                if (target.id === 'check-workorder' || target.closest('#check-workorder')) {
+                    e.preventDefault();
+                    this.checkWorkOrder();
+                    return;
+                }
+
+                // Manual diskon button
+                if (target.id === 'manual-diskon-btn' || target.closest('#manual-diskon-btn')) {
+                    e.preventDefault();
+                    this.showManualDiskonModal();
+                    return;
+                }
+
+                // Template buttons dengan event delegation
+                if (target.closest('.template-btn') && !target.closest('.edit-template-btn')) {
+                    e.preventDefault();
+                    const templateBtn = target.closest('.template-btn');
+                    const templateType = templateBtn.getAttribute('data-template');
+                    this.handleTemplateButtonClick(templateType, templateBtn);
+                    return;
+                }
+
+                // Edit template buttons
+                if (target.closest('.edit-template-btn')) {
+                    e.preventDefault();
+                    const editBtn = target.closest('.edit-template-btn');
+                    const templateType = editBtn.getAttribute('data-template');
+                    this.openTemplateEditor(templateType);
+                    return;
+                }
+            });
+        }
+
+        // Method untuk handle template button click
+        handleTemplateButtonClick(templateType, buttonElement) {
+            // Update tampilan template
+            this.updateTemplateDisplay(templateType);
+
+            // Highlight tombol yang aktif
+            document.querySelectorAll('.template-btn').forEach(b => {
+                b.style.background = '#e3f2fd';
+                b.style.color = '#1976d2';
+                b.style.border = '1px solid #bbdefb';
+                b.classList.remove('active');
+            });
+
+            buttonElement.style.background = '#1976d2';
+            buttonElement.style.color = 'white';
+            buttonElement.style.border = '1px solid #1976d2';
+            buttonElement.classList.add('active');
+
+            // Simpan template yang dipilih
+            this.selectedTemplateType = templateType;
+        }
+
+        // Method khusus untuk download PDF
+        downloadPDFHandler() {
+            if (!this.currentDetail) {
+                this.showNotification('Pilih estimasi terlebih dahulu', 'warning');
+                return;
+            }
+
+            // Simpan state manual diskon sebelum generate PDF
+            console.log('📊 Manual diskon sebelum generate PDF:');
+            console.log('  - Manual Sparepart:', this.diskonSettings.manualSparepart);
+            console.log('  - Manual Jasa:', this.diskonSettings.manualJasa);
+
+            // Panggil fungsi generate PDF dengan menggunakan this sebagai context
+            generatePdfA5.call(this);
+        }
+
         clearFilters() {
             const searchInput = document.getElementById('search-not-accept');
             const dateFilter = document.getElementById('date-filter-not-accept');
@@ -98,6 +213,80 @@
                 const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
                 dateFilter.value = firstDay.toISOString().split('T')[0];
             }
+
+            this.filterNotAcceptData('');
+        }
+
+        updateSearchInputValue() {
+            const searchInput = document.getElementById('search-not-accept');
+            if (searchInput && searchInput.value !== this.searchState.term) {
+                searchInput.value = this.searchState.term;
+
+                // ✅ OTOMATIS FOKUS DAN SET CURSOR POSISI
+                this.focusSearchInput();
+            }
+        }
+
+        focusSearchInput() {
+            const searchInput = document.getElementById('search-not-accept');
+            if (searchInput) {
+                setTimeout(() => {
+                    searchInput.focus();
+                    // Set cursor ke akhir text
+                    const length = searchInput.value.length;
+                    searchInput.setSelectionRange(length, length);
+                    console.log('🎯 Search input re-focused');
+                }, 10);
+            }
+        }
+
+        resetFilters() {
+            console.log('🔄 Resetting all filters...');
+
+            // ✅ RESET SEMUA STATE TAPI showAll TETAP TRUE
+            this.searchState.term = '';
+            this.searchState.date = '';
+            // this.searchState.showAll = true; // ✅ JANGAN reset showAll, biarkan true
+
+            // Set tanggal default
+            const today = new Date();
+            const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
+            this.searchState.date = firstDay.toISOString().split('T')[0];
+
+            // ✅ KEMBALI KE SEMUA DATA (karena showAll = true)
+            this.filteredData = [...this.originalData];
+
+            console.log('✅ Filters reset. Showing all data:', this.filteredData.length);
+            this.renderCurrentTab();
+            this.showNotification('Filter berhasil direset - Menampilkan semua data', 'success');
+        }
+
+        // ✅ METHOD UNTUK TOGGLE SHOW ALL DATA - PERBAIKI
+        toggleShowAll() {
+            // ✅ TOGGLE STATE
+            this.searchState.showAll = !this.searchState.showAll;
+
+            const mode = this.searchState.showAll ? 'SEMUA DATA' : 'HANYA COMPLETED';
+            console.log(`🔄 Switching to: ${mode}`);
+
+            // ✅ PANGGIL filterNotAcceptData DENGAN TERM YANG ADA
+            // Ini akan menerapkan semua filter dengan mode baru
+            this.filterNotAcceptData(this.searchState.term);
+
+            this.showNotification(
+                this.searchState.showAll ? 'Menampilkan semua data' : 'Menampilkan hanya data completed',
+                'info'
+            );
+        }
+
+        clearSearch() {
+            this.searchState.term = '';
+            this.searchState.date = '';
+
+            // Reset ke tanggal default
+            const today = new Date();
+            const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
+            this.searchState.date = firstDay.toISOString().split('T')[0];
 
             this.filterNotAcceptData('');
         }
@@ -323,6 +512,42 @@
                     this.openWorkOrderInCRM(workOrders[index]);
                 });
             });
+        }
+
+        attachOtherEvents() {
+            // Manual diskon button
+            const manualDiskonBtn = document.getElementById('manual-diskon-btn');
+            if (manualDiskonBtn) {
+                manualDiskonBtn.addEventListener('click', () => {
+                    this.showManualDiskonModal();
+                });
+            }
+
+            // Diskon settings
+            const discSparepartMid = document.getElementById('disc-sparepart-mid');
+            const discJasaMid = document.getElementById('disc-jasa-mid');
+
+            const updateDiskonSettings = () => {
+                this.diskonSettings.sparepart = parseInt(discSparepartMid?.value) || 0;
+                this.diskonSettings.jasa = parseInt(discJasaMid?.value) || 0;
+                this.renderCurrentTab();
+            };
+
+            if (discSparepartMid) {
+                discSparepartMid.addEventListener('change', updateDiskonSettings);
+                discSparepartMid.addEventListener('input', updateDiskonSettings);
+            }
+
+            if (discJasaMid) {
+                discJasaMid.addEventListener('change', updateDiskonSettings);
+                discJasaMid.addEventListener('input', updateDiskonSettings);
+            }
+
+            // Event untuk navigasi foto
+            this.attachFotoEvents();
+
+            // Button events
+            this.attachButtonEvents();
         }
 
         openWorkOrderInCRM(workOrder) {
@@ -1333,7 +1558,6 @@
             });
         }
 
-        // Method untuk menampilkan modal diskon manual dengan desain IOS Frosted Glass
         showManualDiskonModal() {
             if (!this.currentDetail) {
                 this.showNotification('Pilih estimasi terlebih dahulu', 'warning');
@@ -1343,139 +1567,324 @@
             const spareparts = this.parseSpareparts(this.currentDetail);
             const services = this.parseServices(this.currentDetail);
 
-            // CSS Styles untuk efek IOS
             const styles = `
-            <style>
-                .ios-overlay {
-                    position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-                    background: rgba(0, 0, 0, 0.3);
-                    backdrop-filter: blur(4px);
-                    -webkit-backdrop-filter: blur(4px);
-                    display: flex; align-items: center; justify-content: center;
-                    z-index: 10000;
-                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-                }
-                .ios-modal {
-                    background: rgba(255, 255, 255, 0.85);
-                    backdrop-filter: blur(20px) saturate(180%);
-                    -webkit-backdrop-filter: blur(20px) saturate(180%);
-                    padding: 0;
-                    border-radius: 24px;
-                    width: 850px;
-                    max-width: 92%;
-                    max-height: 90vh;
-                    box-shadow: 0 20px 40px rgba(0,0,0,0.2);
-                    border: 1px solid rgba(255, 255, 255, 0.4);
-                    display: flex;
-                    flex-direction: column;
-                    overflow: hidden;
-                }
-                .ios-header {
-                    padding: 20px 24px;
-                    display: flex; justify-content: space-between; align-items: center;
-                    border-bottom: 1px solid rgba(0,0,0,0.05);
-                    background: rgba(255,255,255,0.5);
-                }
-                .ios-title {
-                    margin: 0; color: #1c1c1e; font-size: 18px; font-weight: 600;
-                    display: flex; align-items: center;
-                }
-                .ios-close-btn {
-                    background: #e5e5ea; border: none; cursor: pointer; color: #8e8e93;
-                    width: 30px; height: 30px; border-radius: 50%;
-                    display: flex; align-items: center; justify-content: center;
-                    transition: all 0.2s;
-                }
-                .ios-close-btn:hover { background: #d1d1d6; color: #333; }
+<style>
+/* Overlay */
+.ios-overlay {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,.35);
+    backdrop-filter: blur(2px);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 10000;
+}
 
-                .ios-content {
-                    padding: 24px;
-                    overflow-y: auto;
-                    display: grid; grid-template-columns: 1fr 1fr; gap: 24px;
-                }
+/* Modal */
+.ios-modal {
+    background: #fff;
+    border-radius: 16px;
+    width: 92%;
+    max-width: 780px;
+    max-height: 85vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.25);
+}
 
-                /* Scrollbar iOS style */
-                .ios-scroll-area::-webkit-scrollbar { width: 6px; }
-                .ios-scroll-area::-webkit-scrollbar-track { background: transparent; }
-                .ios-scroll-area::-webkit-scrollbar-thumb { background-color: rgba(0,0,0,0.2); border-radius: 20px; }
+/* Header */
+.ios-header {
+    padding: 14px 18px;
+    border-bottom: 1px solid #e6e6e6;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #fafafa;
+}
+.ios-title {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.ios-close-btn {
+    background: none;
+    border: none;
+    padding: 5px;
+    cursor: pointer;
+    border-radius: 8px;
+    color: #666;
+    transition: background 0.2s;
+}
+.ios-close-btn:hover {
+    background: rgba(0,0,0,0.08);
+}
 
-                .ios-section-title {
-                    margin: 0 0 12px 0; color: #8e8e93; font-size: 13px; font-weight: 600;
-                    text-transform: uppercase; letter-spacing: 0.5px;
-                    display: flex; justify-content: space-between; align-items: center;
-                }
+/* Content */
+.ios-content {
+    padding: 16px;
+    overflow-y: auto;
+    flex: 1;
+}
 
-                .ios-card-group {
-                    background: rgba(255, 255, 255, 0.6);
-                    border-radius: 16px;
-                    overflow: hidden;
-                }
+/* 2 kolom */
+.ios-two-column {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 22px;
+}
+@media (max-width: 768px) {
+    .ios-two-column {
+        grid-template-columns: 1fr;
+    }
+}
 
-                .ios-item {
-                    padding: 16px;
-                    border-bottom: 1px solid rgba(0,0,0,0.05);
-                    transition: background 0.2s;
-                }
-                .ios-item:last-child { border-bottom: none; }
-                .ios-item.active { background: rgba(255, 248, 225, 0.8); }
+/* Section title */
+.ios-section-title {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid #eee;
+    font-size: 14px;
+    font-weight: 600;
+}
 
-                .ios-input-group {
-                    display: flex; align-items: center; gap: 10px; margin-top: 12px;
-                }
-                .ios-input {
-                    flex: 1; padding: 10px 12px;
-                    background: rgba(118, 118, 128, 0.12);
-                    border: none; border-radius: 10px;
-                    font-size: 15px; color: #1c1c1e;
-                    transition: all 0.2s;
-                }
-                .ios-input:focus { outline: none; background: rgba(118, 118, 128, 0.18); }
+/* Reset button */
+.btn-reset {
+    padding: 4px 10px;
+    font-size: 11px;
+    border-radius: 6px;
+    background: #ff9500;
+    color: white;
+    border: none;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+.btn-reset:hover {
+    background: #e68500;
+}
 
-                .ios-btn-small {
-                    border: none; border-radius: 8px; font-size: 13px; font-weight: 600;
-                    padding: 8px 12px; cursor: pointer; transition: transform 0.1s;
-                }
-                .ios-btn-small:active { transform: scale(0.96); }
-                .btn-apply { background: #007aff; color: white; }
-                .btn-remove { background: rgba(255, 59, 48, 0.1); color: #ff3b30; }
-                .btn-reset { color: #007aff; background: none; border: none; cursor: pointer; font-size: 13px; font-weight: 500; }
+/* Bulk box */
+.ios-bulk-controls {
+    background: #f8f8f8;
+    border: 1px solid #e3e3e3;
+    border-radius: 12px;
+    padding: 14px 16px;
+    margin-bottom: 16px;
+}
 
-                .ios-footer {
-                    padding: 20px 24px;
-                    background: rgba(255,255,255,0.5);
-                    border-top: 1px solid rgba(0,0,0,0.05);
-                    display: flex; justify-content: space-between; align-items: center;
-                }
-                .ios-footer-btn {
-                    padding: 12px 24px; border-radius: 12px; border: none;
-                    font-size: 15px; font-weight: 600; cursor: pointer;
-                    transition: transform 0.1s;
-                }
-                .ios-footer-btn:active { transform: scale(0.96); }
-                .btn-primary-ios { background: #34c759; color: white; box-shadow: 0 4px 12px rgba(52, 199, 89, 0.3); }
-                .btn-secondary-ios { background: rgba(118, 118, 128, 0.12); color: #1c1c1e; }
+.ios-bulk-input-group {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
 
-                @media (max-width: 768px) {
-                    .ios-content { grid-template-columns: 1fr; }
-                }
-            </style>
-        `;
+.ios-bulk-label {
+    font-size: 13px;
+    font-weight: 500;
+    min-width: 120px;
+}
+
+/* Bulk Input */
+.ios-input {
+    padding: 6px 10px;
+    font-size: 13px;
+    height: 36px;
+    border-radius: 8px;
+    border: 1px solid #bbb;
+    width: 60px;
+    text-align: center;
+}
+
+/* Individual item styling */
+.ios-item {
+    border: 1px solid #ddd;
+    border-radius: 10px;
+    padding: 12px;
+    margin-bottom: 10px;
+    background: #fff;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    transition: all 0.2s ease;
+}
+.ios-item:hover {
+    box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+}
+.ios-item.active {
+    border-color: #ff9f0a;
+    background: #fff7e0;
+}
+
+/* Item info */
+.item-info {
+    flex: 1;
+    margin-right: 12px;
+    min-width: 0;
+}
+.item-name {
+    font-weight: 600;
+    font-size: 14px;
+    margin-bottom: 3px;
+    color: #1c1c1e;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.item-details {
+    font-size: 12px;
+    color: #666;
+    margin-bottom: 4px;
+}
+.item-price {
+    font-size: 13px;
+    color: #34c759;
+    font-weight: 500;
+}
+
+/* Input group for individual items */
+.ios-input-group {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 140px;
+    justify-content: flex-end;
+}
+
+/* Individual input */
+.manual-diskon-input {
+    width: 65px !important;
+    height: 34px;
+    padding: 4px 8px;
+    border-radius: 8px;
+    border: 1px solid #bbb;
+    font-size: 13px;
+    text-align: center;
+    box-sizing: border-box;
+}
+.manual-diskon-input:focus {
+    outline: none;
+    border-color: #007aff;
+    box-shadow: 0 0 0 2px rgba(0,122,255,0.2);
+}
+
+/* Buttons */
+.ios-btn-small {
+    padding: 6px 10px;
+    border-radius: 6px;
+    border: none;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+    transition: all 0.2s ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 45px;
+    height: 34px;
+    box-sizing: border-box;
+}
+.ios-btn-small:hover {
+    transform: translateY(-1px);
+}
+
+.btn-bulk {
+    background: #007aff;
+    color: #fff;
+}
+.btn-bulk:hover {
+    background: #0056cc;
+}
+
+.btn-apply {
+    background: #34c759;
+    color: #fff;
+}
+.btn-apply:hover {
+    background: #2e9e4a;
+}
+
+.btn-remove {
+    background: #ff3b30;
+    color: #fff;
+    padding: 6px 8px !important;
+    min-width: 34px !important;
+}
+.btn-remove:hover {
+    background: #d32f2f;
+}
+
+/* Footer */
+.ios-footer {
+    padding: 14px 16px;
+    border-top: 1px solid #e6e6e6;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #fafafa;
+}
+
+.ios-footer-btn {
+    padding: 8px 16px;
+    font-size: 14px;
+    border-radius: 10px;
+    border: none;
+    cursor: pointer;
+    font-weight: 600;
+    transition: all 0.2s;
+}
+
+.btn-primary-ios {
+    background: #007aff;
+    color: #fff;
+}
+.btn-primary-ios:hover {
+    background: #0056cc;
+}
+
+.btn-secondary-ios {
+    background: #8e8e93;
+    color: #fff;
+}
+.btn-secondary-ios:hover {
+    background: #6c6c70;
+}
+
+/* Scrollbar */
+.ios-scroll-area::-webkit-scrollbar {
+    width: 6px;
+}
+.ios-scroll-area::-webkit-scrollbar-track {
+    background: #f1f1f1;
+    border-radius: 3px;
+}
+.ios-scroll-area::-webkit-scrollbar-thumb {
+    background: #c1c1c1;
+    border-radius: 3px;
+}
+</style>
+`;
 
             let modalHtml = `
-        ${styles}
-        <div id="manual-diskon-modal" class="ios-overlay">
-            <div class="ios-modal">
-                <div class="ios-header">
-                    <h3 class="ios-title">
-                        <i class="material-icons" style="margin-right: 8px; color: #ff9f0a;">edit</i>
-                        Edit Diskon Manual
-                    </h3>
-                    <button id="close-manual-diskon-modal" class="ios-close-btn">
-                        <i class="material-icons" style="font-size: 20px;">close</i>
-                    </button>
-                </div>
+    ${styles}
+    <div id="manual-diskon-modal" class="ios-overlay">
+        <div class="ios-modal">
+            <div class="ios-header">
+                <h3 class="ios-title">
+                    <i class="material-icons" style="margin-right: 8px; color: #ff9f0a;">edit</i>
+                    Edit Diskon Manual
+                </h3>
+                <button id="close-manual-diskon-modal" class="ios-close-btn">
+                    <i class="material-icons" style="font-size: 20px;">close</i>
+                </button>
+            </div>
 
-                <div class="ios-content ios-scroll-area">
+            <div class="ios-content ios-scroll-area">
+                <div class="ios-two-column">
     `;
 
             // --- Panel Sparepart ---
@@ -1488,7 +1897,27 @@
                         Reset All
                     </button>
                 </h4>
-                <div class="ios-card-group">
+
+                <!-- Bulk Controls untuk Sparepart -->
+                <div class="ios-bulk-controls">
+                    <div class="ios-bulk-input-group">
+                        <span class="ios-bulk-label">Diskon Semua Sparepart:</span>
+                        <input type="number"
+                               id="bulk-diskon-sparepart"
+                               class="ios-input"
+                               placeholder="0%"
+                               min="0"
+                               max="100">
+                        <button id="apply-bulk-sparepart" class="ios-btn-small btn-bulk">
+                            Terapkan
+                        </button>
+                        <button id="remove-bulk-sparepart" class="ios-btn-small btn-remove">
+                            Hapus
+                        </button>
+                    </div>
+                </div>
+
+                <div>
         `;
 
                 spareparts.forEach((part, index) => {
@@ -1499,12 +1928,10 @@
 
                     modalHtml += `
                 <div class="ios-item ${diskonManual ? 'active' : ''}">
-                    <div>
-                        <div style="font-weight: 600; font-size: 15px; margin-bottom: 4px; color: #1c1c1e;">${part.name || 'Sparepart'}</div>
-                        <div style="font-size: 13px; color: #8e8e93; display: flex; justify-content: space-between;">
-                            <span>${part.qty || 1} x Rp ${(part.price || 0).toLocaleString('id-ID')}</span>
-                        </div>
-                        <div style="font-size: 13px; color: #34c759; margin-top: 4px; font-weight: 500;">
+                    <div class="item-info">
+                        <div class="item-name">${part.name || 'Sparepart'}</div>
+                        <div class="item-details">${part.qty || 1} × Rp ${(part.price || 0).toLocaleString('id-ID')}</div>
+                        <div class="item-price">
                             Rp ${Math.round(hargaSetelahDiskon).toLocaleString('id-ID')}
                             ${diskonAktif > 0 ? `<span style="background: rgba(52, 199, 89, 0.1); padding: 2px 6px; border-radius: 4px; margin-left: 5px; font-size: 11px;">-${diskonAktif}%</span>` : ''}
                         </div>
@@ -1512,23 +1939,24 @@
 
                     <div class="ios-input-group">
                         <input type="number"
-                               class="manual-diskon-input ios-input"
+                               class="manual-diskon-input"
                                data-type="sparepart"
                                data-index="${index}"
                                value="${diskonManual}"
                                placeholder="0%"
                                min="0"
-                               max="100">
-                        <button class="btn-apply-manual-diskon ios-btn-small btn-apply"
+                               max="100"
+                               step="0.1">
+                        <button class="ios-btn-small btn-apply btn-apply-manual-diskon"
                                 data-type="sparepart"
                                 data-index="${index}">
                             Set
                         </button>
-                        ${diskonManual ? `
-                            <button class="btn-remove-manual-diskon ios-btn-small btn-remove"
+                        ${diskonManual !== '' ? `
+                            <button class="ios-btn-small btn-remove btn-remove-manual-diskon"
                                     data-type="sparepart"
                                     data-index="${index}">
-                                <i class="material-icons" style="font-size: 16px;">close</i>
+                                ×
                             </button>
                         ` : ''}
                     </div>
@@ -1552,7 +1980,27 @@
                         Reset All
                     </button>
                 </h4>
-                <div class="ios-card-group">
+
+                <!-- Bulk Controls untuk Jasa -->
+                <div class="ios-bulk-controls">
+                    <div class="ios-bulk-input-group">
+                        <span class="ios-bulk-label">Diskon Semua Jasa:</span>
+                        <input type="number"
+                               id="bulk-diskon-jasa"
+                               class="ios-input"
+                               placeholder="0%"
+                               min="0"
+                               max="100">
+                        <button id="apply-bulk-jasa" class="ios-btn-small btn-bulk">
+                            Terapkan
+                        </button>
+                        <button id="remove-bulk-jasa" class="ios-btn-small btn-remove">
+                            Hapus
+                        </button>
+                    </div>
+                </div>
+
+                <div>
         `;
 
                 services.forEach((service, index) => {
@@ -1563,12 +2011,10 @@
 
                     modalHtml += `
                 <div class="ios-item ${diskonManual ? 'active' : ''}">
-                    <div>
-                        <div style="font-weight: 600; font-size: 15px; margin-bottom: 4px; color: #1c1c1e;">${service.name || 'Jasa'}</div>
-                        <div style="font-size: 13px; color: #8e8e93;">
-                            ${service.hour || 1} jam x Rp ${(service.price || 0).toLocaleString('id-ID')}
-                        </div>
-                        <div style="font-size: 13px; color: #34c759; margin-top: 4px; font-weight: 500;">
+                    <div class="item-info">
+                        <div class="item-name">${service.name || 'Jasa'}</div>
+                        <div class="item-details">${service.hour || 1} jam × Rp ${(service.price || 0).toLocaleString('id-ID')}</div>
+                        <div class="item-price">
                             Rp ${Math.round(hargaSetelahDiskon).toLocaleString('id-ID')}
                             ${diskonAktif > 0 ? `<span style="background: rgba(52, 199, 89, 0.1); padding: 2px 6px; border-radius: 4px; margin-left: 5px; font-size: 11px;">-${diskonAktif}%</span>` : ''}
                         </div>
@@ -1576,23 +2022,24 @@
 
                     <div class="ios-input-group">
                         <input type="number"
-                               class="manual-diskon-input ios-input"
+                               class="manual-diskon-input"
                                data-type="jasa"
                                data-index="${index}"
                                value="${diskonManual}"
                                placeholder="0%"
                                min="0"
-                               max="100">
-                        <button class="btn-apply-manual-diskon ios-btn-small btn-apply"
+                               max="100"
+                               step="0.1">
+                        <button class="ios-btn-small btn-apply btn-apply-manual-diskon"
                                 data-type="jasa"
                                 data-index="${index}">
                             Set
                         </button>
-                        ${diskonManual ? `
-                            <button class="btn-remove-manual-diskon ios-btn-small btn-remove"
+                        ${diskonManual !== '' ? `
+                            <button class="ios-btn-small btn-remove btn-remove-manual-diskon"
                                     data-type="jasa"
                                     data-index="${index}">
-                                <i class="material-icons" style="font-size: 16px;">close</i>
+                                ×
                             </button>
                         ` : ''}
                     </div>
@@ -1607,24 +2054,33 @@
             }
 
             modalHtml += `
-                </div> <div class="ios-footer">
-                    <div style="font-size: 13px; color: #8e8e93; display: flex; align-items: center;">
-                        <i class="material-icons" style="font-size: 16px; margin-right: 5px; color: #ff9f0a;">info</i>
-                        Override diskon global
-                    </div>
-                    <div style="display: flex; gap: 12px;">
-                        <button id="close-modal" class="ios-footer-btn btn-secondary-ios">
-                            Batal
-                        </button>
-                        <button id="apply-all-manual-diskon" class="ios-footer-btn btn-primary-ios">
-                            Simpan Perubahan
-                        </button>
-                    </div>
+                </div>
+            </div>
+            <div class="ios-footer">
+                <div style="font-size: 13px; color: #8e8e93; display: flex; align-items: center;">
+                    <i class="material-icons" style="font-size: 16px; margin-right: 5px; color: #ff9f0a;">info</i>
+                    Override diskon global
+                </div>
+                <div style="display: flex; gap: 12px;">
+                    <button id="close-modal" class="ios-footer-btn btn-secondary-ios">
+                        Batal
+                    </button>
+                    <button id="apply-all-manual-diskon" class="ios-footer-btn btn-primary-ios">
+                        Simpan Perubahan
+                    </button>
                 </div>
             </div>
         </div>
+    </div>
     `;
 
+            // Hapus modal sebelumnya jika ada
+            const existingModal = document.getElementById('manual-diskon-modal');
+            if (existingModal) {
+                existingModal.remove();
+            }
+
+            // Tambahkan modal baru
             const modalDiv = document.createElement('div');
             modalDiv.innerHTML = modalHtml;
             document.body.appendChild(modalDiv);
@@ -1633,171 +2089,332 @@
             this.attachManualDiskonModalEvents();
         }
 
-        // Method untuk attach events modal diskon manual (Optimized)
+        // Method untuk attach events modal diskon manual (FIXED VERSION)
         attachManualDiskonModalEvents() {
-            // Ambil elemen overlay (wrapper utama)
             const modalOverlay = document.getElementById('manual-diskon-modal');
             if (!modalOverlay) return;
-
-            // --- 1. Fungsi Utilitas ---
 
             // Fungsi tutup modal
             const closeModal = () => {
                 modalOverlay.remove();
             };
 
-            // Fungsi Refresh (Simpan state -> Tutup -> Buka lagi)
-            // Ini memastikan UI selalu sinkron dengan data (warna berubah, tombol hapus muncul)
+            // Fungsi refresh modal
             const refreshModal = () => {
                 closeModal();
                 this.showManualDiskonModal();
             };
 
-            // --- 2. Event Delegation (Menangani Klik pada tombol apapun di dalam modal) ---
+            // Event delegation untuk semua tombol dalam modal
             modalOverlay.addEventListener('click', (e) => {
                 const target = e.target;
+                const button = target.closest('button');
 
-                // A. Logika Tutup (Klik Overlay, Tombol X Header, Tombol Batal Footer)
-                if (
-                    target === modalOverlay ||
-                    target.closest('#close-manual-diskon-modal') ||
-                    target.closest('#close-modal')
-                ) {
+                if (!button) return;
+
+                // 1. Tombol Close
+                if (button.id === 'close-manual-diskon-modal' || button.id === 'close-modal') {
                     closeModal();
                     return;
                 }
 
-                // B. Logika Reset All
-                if (target.closest('#reset-all-sparepart')) {
-                    this.diskonSettings.manualSparepart = []; // Reset array
+                // 2. Reset All Sparepart
+                if (button.id === 'reset-all-sparepart') {
+                    this.diskonSettings.manualSparepart = {};
                     this.showNotification('Diskon sparepart direset', 'info');
                     refreshModal();
                     return;
                 }
-                if (target.closest('#reset-all-jasa')) {
-                    this.diskonSettings.manualJasa = []; // Reset array
+
+                // 3. Reset All Jasa
+                if (button.id === 'reset-all-jasa') {
+                    this.diskonSettings.manualJasa = {};
                     this.showNotification('Diskon jasa direset', 'info');
                     refreshModal();
                     return;
                 }
 
-                // C. Logika Tombol Per Item (Apply & Remove)
-                // Cek apakah yang diklik adalah tombol apply atau remove
-                const applyBtn = target.closest('.btn-apply-manual-diskon');
-                const removeBtn = target.closest('.btn-remove-manual-diskon');
-
-                if (applyBtn) {
-                    const type = applyBtn.dataset.type;
-                    const index = applyBtn.dataset.index;
-                    const input = document.querySelector(`.manual-diskon-input[data-type="${type}"][data-index="${index}"]`);
-
-                    // Validasi Input
-                    let value = parseFloat(input.value);
-                    if (isNaN(value)) value = 0;
+                // 4. Apply Bulk Sparepart
+                if (button.id === 'apply-bulk-sparepart') {
+                    const input = document.getElementById('bulk-diskon-sparepart');
+                    const value = parseFloat(input.value) || 0;
 
                     if (value >= 0 && value <= 100) {
-                        // Update State
-                        if (type === 'sparepart') {
-                            this.diskonSettings.manualSparepart[index] = value;
-                        } else {
-                            this.diskonSettings.manualJasa[index] = value;
-                        }
-                        // this.showNotification(`Diskon ${value}% diset`, 'success'); // Optional: notify per item
+                        this.applyBulkDiskon('sparepart', value);
+                        this.showNotification(`Diskon ${value}% diterapkan ke semua sparepart`, 'success');
                         refreshModal();
                     } else {
-                        this.showNotification('Diskon harus 0-100%', 'error');
+                        this.showNotification('Diskon harus antara 0-100%', 'error');
                     }
                     return;
                 }
 
-                if (removeBtn) {
-                    const type = removeBtn.dataset.type;
-                    const index = removeBtn.dataset.index;
-
-                    // Hapus dari state
-                    if (type === 'sparepart') {
-                        delete this.diskonSettings.manualSparepart[index];
-                    } else {
-                        delete this.diskonSettings.manualJasa[index];
-                    }
-
-                    // this.showNotification('Diskon manual dihapus', 'info'); // Optional
+                // 5. Remove Bulk Sparepart
+                if (button.id === 'remove-bulk-sparepart') {
+                    this.removeBulkDiskon('sparepart');
+                    this.showNotification('Diskon sparepart dihapus', 'info');
                     refreshModal();
                     return;
                 }
 
-                // D. Logika Apply All (Simpan Perubahan & Tutup)
-                if (target.closest('#apply-all-manual-diskon')) {
-                    // Di sini Anda bisa memanggil fungsi hitung ulang total global
-                    // Contoh: this.calculateGrandTotal();
+                // 6. Apply Bulk Jasa
+                if (button.id === 'apply-bulk-jasa') {
+                    const input = document.getElementById('bulk-diskon-jasa');
+                    const value = parseFloat(input.value) || 0;
 
+                    if (value >= 0 && value <= 100) {
+                        this.applyBulkDiskon('jasa', value);
+                        this.showNotification(`Diskon ${value}% diterapkan ke semua jasa`, 'success');
+                        refreshModal();
+                    } else {
+                        this.showNotification('Diskon harus antara 0-100%', 'error');
+                    }
+                    return;
+                }
+
+                // 7. Remove Bulk Jasa
+                if (button.id === 'remove-bulk-jasa') {
+                    this.removeBulkDiskon('jasa');
+                    this.showNotification('Diskon jasa dihapus', 'info');
+                    refreshModal();
+                    return;
+                }
+
+                // 8. Apply Individual Diskon
+                if (button.classList.contains('btn-apply-manual-diskon')) {
+                    const type = button.dataset.type;
+                    const index = parseInt(button.dataset.index);
+                    const input = document.querySelector(`.manual-diskon-input[data-type="${type}"][data-index="${index}"]`);
+                    const value = parseFloat(input.value) || 0;
+
+                    if (value >= 0 && value <= 100) {
+                        this.applyManualDiskon(type, index, value);
+                        this.showNotification(`Diskon ${value}% diset untuk ${type}`, 'success');
+                        refreshModal();
+                    } else {
+                        this.showNotification('Diskon harus antara 0-100%', 'error');
+                    }
+                    return;
+                }
+
+                // 9. Remove Individual Diskon
+                if (button.classList.contains('btn-remove-manual-diskon')) {
+                    const type = button.dataset.type;
+                    const index = parseInt(button.dataset.index);
+
+                    this.applyManualDiskon(type, index, '');
+                    this.showNotification(`Diskon manual dihapus untuk ${type}`, 'info');
+                    refreshModal();
+                    return;
+                }
+
+                // 10. Apply All Changes
+                if (button.id === 'apply-all-manual-diskon') {
                     this.showNotification('Perubahan diskon manual diterapkan', 'success');
                     closeModal();
-                    // Jika perlu refresh tampilan di tabel utama:
+                    // Refresh tampilan utama
                     if (typeof this.renderCurrentTab === 'function') {
                         this.renderCurrentTab();
+                    }
+                    return;
+                }
+            });
+
+            // Support Enter key untuk bulk inputs
+            modalOverlay.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') {
+                    const target = e.target;
+
+                    if (target.id === 'bulk-diskon-sparepart') {
+                        document.getElementById('apply-bulk-sparepart').click();
+                    } else if (target.id === 'bulk-diskon-jasa') {
+                        document.getElementById('apply-bulk-jasa').click();
                     }
                 }
             });
 
-            // --- 3. Event Input (Enter Key) ---
-            // Menggunakan delegation 'keyup' pada overlay
-            modalOverlay.addEventListener('keyup', (e) => {
+            // Juga tambahkan event untuk input individual dengan Enter
+            modalOverlay.addEventListener('keypress', (e) => {
                 if (e.key === 'Enter' && e.target.classList.contains('manual-diskon-input')) {
                     const type = e.target.dataset.type;
                     const index = e.target.dataset.index;
-
-                    // Cari tombol apply pasangannya dan klik secara programatik
                     const btn = document.querySelector(`.btn-apply-manual-diskon[data-type="${type}"][data-index="${index}"]`);
                     if (btn) btn.click();
                 }
             });
         }
 
-        // Method helper untuk update item dalam modal
-        updateManualDiskonModalItem(type, index, value) {
-            const item = document.querySelector(`.manual-diskon-item .manual-diskon-input[data-type="${type}"][data-index="${index}"]`).closest('.manual-diskon-item');
+        // Method applyBulkDiskon yang sudah diperbaiki
+        applyBulkDiskon(type, value) {
+            const diskonValue = Math.max(0, Math.min(100, Number(value) || 0));
 
-            // Update background color
-            if (value > 0) {
-                item.style.background = '#fff8e1';
-            } else {
-                item.style.background = 'white';
+            // Pastikan diskonSettings ada dan menggunakan OBJECT
+            if (!this.diskonSettings) {
+                this.diskonSettings = {
+                    manualSparepart: {},
+                    manualJasa: {}
+                };
             }
 
-            // Update harga display
-            const estimasi = this.currentDetail;
-            const spareparts = this.parseSpareparts(estimasi);
-            const services = this.parseServices(estimasi);
-
-            let hargaNormal = 0;
-            if (type === 'sparepart' && spareparts[index]) {
-                hargaNormal = (spareparts[index].price || 0) * (spareparts[index].qty || 1);
-            } else if (type === 'jasa' && services[index]) {
-                hargaNormal = (services[index].price || 0) * (services[index].hour || 1);
+            if (type === 'sparepart') {
+                const spareparts = this.parseSpareparts(this.currentDetail) || [];
+                // Reset dulu lalu set semua dengan nilai yang sama menggunakan OBJECT
+                this.diskonSettings.manualSparepart = {};
+                spareparts.forEach((_, index) => {
+                    this.diskonSettings.manualSparepart[index] = diskonValue;
+                });
+            } else if (type === 'jasa') {
+                const services = this.parseServices(this.currentDetail) || [];
+                // Reset dulu lalu set semua dengan nilai yang sama menggunakan OBJECT
+                this.diskonSettings.manualJasa = {};
+                services.forEach((_, index) => {
+                    this.diskonSettings.manualJasa[index] = diskonValue;
+                });
             }
 
-            const diskonAktif = value > 0 ? value : (type === 'sparepart' ? this.diskonSettings.sparepart : this.diskonSettings.jasa);
-            const hargaSetelahDiskon = hargaNormal * (1 - diskonAktif / 100);
-
-            const priceDisplay = item.querySelector('div > div:nth-child(3)');
-            if (priceDisplay) {
-                priceDisplay.innerHTML = `
-            Harga: Rp ${Math.round(hargaSetelahDiskon).toLocaleString('id-ID')}
-            ${diskonAktif > 0 ? `(-${diskonAktif}%)` : ''}
-        `;
+            // Update perhitungan total
+            if (this.calculateEstimasiTotal) {
+                this.calculateEstimasiTotal();
             }
         }
 
-        // Method untuk close dan refresh modal
-        closeAndRefreshModal() {
+        removeBulkDiskon(type) {
+            // Pastikan diskonSettings ada
+            if (!this.diskonSettings) {
+                this.diskonSettings = {
+                    manualSparepart: {},
+                    manualJasa: {}
+                };
+            }
+
+            if (type === 'sparepart') {
+                this.diskonSettings.manualSparepart = {};
+                // Reset input value
+                const bulkInput = document.getElementById('bulk-diskon-sparepart');
+                if (bulkInput) bulkInput.value = '';
+            } else if (type === 'jasa') {
+                this.diskonSettings.manualJasa = {};
+                // Reset input value
+                const bulkInput = document.getElementById('bulk-diskon-jasa');
+                if (bulkInput) bulkInput.value = '';
+            }
+
+            // Update perhitungan total
+            if (this.calculateEstimasiTotal) {
+                this.calculateEstimasiTotal();
+            }
+        }
+
+        applyManualDiskon(type, index, value) {
+            // Pastikan diskonSettings ada
+            if (!this.diskonSettings) {
+                this.diskonSettings = {
+                    manualSparepart: {},
+                    manualJasa: {}
+                };
+            }
+
+            // Pastikan objek manual ada
+            if (type === 'sparepart' && !this.diskonSettings.manualSparepart) {
+                this.diskonSettings.manualSparepart = {};
+            } else if (type === 'jasa' && !this.diskonSettings.manualJasa) {
+                this.diskonSettings.manualJasa = {};
+            }
+
+            // Handle value (bisa number atau string kosong untuk hapus)
+            if (value === '' || value === null || value === undefined) {
+                // Hapus diskon manual
+                if (type === 'sparepart') {
+                    delete this.diskonSettings.manualSparepart[index];
+                } else if (type === 'jasa') {
+                    delete this.diskonSettings.manualJasa[index];
+                }
+            } else {
+                // Set diskon manual
+                const diskonValue = Math.max(0, Math.min(100, Number(value)));
+                if (type === 'sparepart') {
+                    this.diskonSettings.manualSparepart[index] = diskonValue;
+                } else if (type === 'jasa') {
+                    this.diskonSettings.manualJasa[index] = diskonValue;
+                }
+            }
+
+            // Update perhitungan total
+            if (this.calculateEstimasiTotal) {
+                this.calculateEstimasiTotal();
+            }
+        }
+
+        closeManualDiskonModal() {
             const modal = document.getElementById('manual-diskon-modal');
             if (modal) {
                 document.body.removeChild(modal);
             }
-            this.showManualDiskonModal(); // Buka modal baru dengan data terbaru
         }
 
+        parseSpareparts(estimasi) {
+            if (!estimasi.sparepart_data) return [];
+            try {
+                const spareparts = typeof estimasi.sparepart_data === 'string'
+                ? JSON.parse(estimasi.sparepart_data)
+                : estimasi.sparepart_data;
+                return Array.isArray(spareparts) ? spareparts : [];
+            } catch (e) {
+                return [];
+            }
+        }
+
+        parseServices(estimasi) {
+            if (!estimasi.service_data) return [];
+            try {
+                const services = typeof estimasi.service_data === 'string'
+                ? JSON.parse(estimasi.service_data)
+                : estimasi.service_data;
+                return Array.isArray(services) ? services : [];
+            } catch (e) {
+                return [];
+            }
+        }
+
+        showNotification(message, type = 'info') {
+            const notification = document.createElement('div');
+            notification.style.cssText = `
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        padding: 15px 20px;
+        border-radius: 6px;
+        color: white;
+        font-weight: 500;
+        z-index: 10000;
+        box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+        transition: all 0.3s ease;
+        max-width: 350px;
+        font-size: 14px;
+    `;
+
+            const colors = {
+                success: '#4caf50',
+                error: '#f44336',
+                info: '#2196f3',
+                warning: '#ff9800'
+            };
+
+            notification.style.background = colors[type] || colors.info;
+            notification.textContent = message;
+
+            document.body.appendChild(notification);
+
+            setTimeout(() => {
+                notification.style.opacity = '0';
+                notification.style.transform = 'translateX(100%)';
+                setTimeout(() => {
+                    if (document.body.contains(notification)) {
+                        document.body.removeChild(notification);
+                    }
+                }, 300);
+            }, 3000);
+        }
 
         // Method untuk toggle tabs
         toggleTabs() {
@@ -1828,6 +2445,9 @@
         }
 
         switchTab(tabId) {
+            // Reset focus state sebelum switch
+            this.lastFocusedElement = null;
+
             this.currentTab = tabId;
 
             document.querySelectorAll('#tabs-container button').forEach(tab => {
@@ -1857,9 +2477,9 @@
 
         async loadData() {
             try {
+                console.log('🔄 Starting loadData...');
                 this.showNotification('Memuat data...', 'info');
 
-                // Load estimasi data dengan semua kolom MRA
                 const { data: estimasiData, error: estimasiError } = await supabase
                 .from('estimasi')
                 .select(`
@@ -1870,37 +2490,90 @@
 
                 if (estimasiError) throw estimasiError;
 
+                console.log('📥 Data loaded from Supabase:', estimasiData.length);
+
                 this.estimasiData = estimasiData.map(estimasi => ({
                     ...estimasi,
                     teknisi_name: estimasi.users?.full_name || '-'
                 }));
 
-                this.filteredData = [...this.estimasiData];
+                // ✅ SIMPAN DATA ASLI TANPA FILTER
+                this.originalData = [...this.estimasiData];
+
+                // ✅ UBAH: Default tampil SEMUA DATA, bukan hanya completed
+                this.filteredData = [...this.originalData];
+
+                console.log('✅ Data processing completed');
+                console.log('📊 Total originalData:', this.originalData.length);
+                console.log('📊 Total filteredData:', this.filteredData.length);
 
                 // AUTO SELECT: Pilih estimasi pertama jika ada data
-                if (this.estimasiData.length > 0 && !this.currentDetail) {
-                    this.selectedId = this.estimasiData[0].id;
-                    this.currentDetail = this.estimasiData[0];
-                    currentEstimasiId = this.estimasiData[0].id;
+                if (this.filteredData.length > 0 && !this.currentDetail) {
+                    this.selectedId = this.filteredData[0].id;
+                    this.currentDetail = this.filteredData[0];
+                    currentEstimasiId = this.filteredData[0].id;
                     this.customerDetail = null;
+                    console.log('🎯 Auto-selected first item:', this.filteredData[0].nopol);
                 }
 
                 this.renderCurrentTab();
                 this.showNotification('Data berhasil dimuat!', 'success');
 
             } catch (error) {
-                console.error('Error loading data:', error);
+                console.error('❌ Error loading data:', error);
                 this.showNotification('Error loading data: ' + error.message, 'error');
             }
         }
 
         renderEstimasiNotAccept(container) {
-            const notAcceptData = this.filteredData.filter(estimasi =>
-                                                           estimasi.status === 'completed'
-                                                          );
+            const notAcceptData = this.filteredData;
 
+            const searchValue = this.searchState.term || '';
+            const showAllMode = this.searchState.showAll;
             container.innerHTML = `
 <style>
+/* ✅ TOMBOL CUSTOM */
+.btn-small {
+    background: #e9ecef;
+    color: #495057;
+    border: none;
+    padding: 8px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 14px;
+    transition: all 0.2s ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 500;
+}
+
+.btn-small:hover {
+    background: #dee2e6;
+    transform: translateY(-1px);
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+/* Tombol aktif */
+.btn-small.active {
+    background: #1e3c72;
+    color: white;
+}
+/* Pastikan input bisa diketik */
+#search-not-accept, #date-filter-not-accept {
+    pointer-events: auto !important;
+    opacity: 1 !important;
+    background: white !important;
+    color: #333 !important;
+}
+
+/* Hilangkan style yang mungkin memblokir input */
+input[type="text"], input[type="date"], input[type="number"] {
+    -webkit-user-select: text !important;
+    -moz-user-select: text !important;
+    -ms-user-select: text !important;
+    user-select: text !important;
+}
 /* Style untuk marking kelengkapan */
 .completeness-marker {
     transition: all 0.3s ease;
@@ -2147,46 +2820,81 @@ word-break: break-word !important;
 <div style="display: flex; height: 100%; gap: 15px;">
 
     <!-- Daftar Estimasi -->
-<div style="flex: 1; display: flex; flex-direction: column; min-width: 0; height: 100%; max-height: 80vh;">
-                <div style="padding: 20px; border-bottom: 1px solid #c5dbff; flex-shrink: 0; background:#f0f6ff;">
-                    <h3 style="margin: 0 0 15px 0; color: #0b3d91; font-size: 18px; font-weight: 600;">
-                        <i class="material-icons colored-icon"
-                           style="vertical-align: middle; margin-right: 8px; font-size: 20px;">list</i>
-                        Daftar Estimasi (Data lengkap : ${notAcceptData.length})
-                    </h3>
-
-                    <div style="position: relative; width: 100%; margin-bottom: 12px;">
-                        <input type="text" id="search-not-accept" placeholder="Cari nopol, customer, atau mobil..."
-                            style="width: 100%; padding: 12px 35px 12px 12px; border: 1px solid #aac7ff; border-radius: 6px;">
-                        <i class="material-icons colored-icon"
-                           style="position: absolute; right: 10px; top: 50%; transform: translateY(-50%); font-size: 20px;">search</i>
-                    </div>
-
-                    <div style="margin-bottom: 8px;">
-                        <label style="display: block; margin-bottom: 6px; font-size: 14px; font-weight: 500; color: #0b3d91;">Filter Tanggal</label>
-                        <input type="date" id="date-filter-not-accept"
-                            style="width: 100%; padding: 12px; border: 1px solid #aac7ff; border-radius: 6px;">
-                    </div>
-                </div>
-
-                <div style="flex: 1; overflow-y: auto; min-height: 0; max-height: 80vh;">
-                    <table class="compact-table">
-                        <thead>
-                            <tr>
-                                <th style="width: 25px;">No</th>
-            <th>Nomor Polisi</th>
-            <th style="width: 120px;">Kelengkapan</th>
-            <th style="width: 120px;">Status MRA</th>
-                            </tr>
-                        </thead>
-                        <tbody id="table-body-not-accept">
-                            ${this.renderNotAcceptTableRows(notAcceptData)}
-                        </tbody>
-                    </table>
+    <div style="flex: 1; display: flex; flex-direction: column; min-width: 0; height: 100%; max-height: 80vh;">
+        <div style="padding: 20px; border-bottom: 1px solid #c5dbff; flex-shrink: 0; background:#f0f6ff;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                <h3 style="margin: 0; color: #0b3d91; font-size: 18px; font-weight: 600;">
+                    <i class="material-icons colored-icon"
+                       style="vertical-align: middle; margin-right: 8px; font-size: 20px;">list</i>
+                    List
+                    <span style="font-size: 14px; color: #666;">
+                        (${showAllMode ? 'All' : 'Complete'}: ${notAcceptData.length})
+                    </span>
+                </h3>
+                <div style="display: flex; gap: 8px;">
+                    <!-- ✅ TOMBOL TOGGLE SHOW ALL - PERBAIKI TEKS -->
+                    <button id="toggle-show-all" class="btn-small"
+                            style="background: ${showAllMode ? '#4caf50' : '#ff9800'}; color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; display: flex; align-items: center;">
+                        <i class="material-icons" style="font-size: 16px; margin-right: 4px;">
+                            ${showAllMode ? 'check_circle' : 'filter_list'}
+                        </i>
+                        ${showAllMode ? 'Complete' : 'All'}
+                    </button>
+                    <!-- ✅ TOMBOL RESET FILTER -->
+                    <button id="reset-filters" class="btn-small" style="background: #f44336; color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; display: flex; align-items: center;">
+                        <i class="material-icons" style="font-size: 16px; margin-right: 4px;">refresh</i>
+                    </button>
                 </div>
             </div>
 
-    <!-- Kanan -->
+            <div style="position: relative; width: 100%; margin-bottom: 12px;">
+                <input type="text" id="search-not-accept"
+                       value="${searchValue}"
+                       placeholder="Cari nopol, customer, atau mobil..."
+                    style="width: 100%; padding: 12px 35px 12px 12px; border: 1px solid #aac7ff; border-radius: 6px;">
+                <i class="material-icons colored-icon"
+                   style="position: absolute; right: 10px; top: 50%; transform: translateY(-50%); font-size: 20px;">search</i>
+            </div>
+
+            <div style="margin-bottom: 8px;">
+                <label style="display: block; margin-bottom: 6px; font-size: 14px; font-weight: 500; color: #0b3d91;">Filter Tanggal</label>
+                <input type="date" id="date-filter-not-accept"
+                       value="${this.searchState.date || ''}"
+                    style="width: 100%; padding: 12px; border: 1px solid #aac7ff; border-radius: 6px;">
+            </div>
+
+            <!-- ✅ INDIKATOR FILTER AKTIF -->
+            ${this.searchState.term || !this.searchState.showAll ? `
+                <div style="background: #e3f2fd; padding: 8px 12px; border-radius: 6px; border-left: 4px solid #2196f3; margin-top: 8px;">
+                    <div style="font-size: 12px; color: #0b3d91;">
+                        <i class="material-icons" style="font-size: 14px; vertical-align: middle;">filter_list</i>
+                        Filter aktif:
+                        ${this.searchState.term ? `Pencarian: "${this.searchState.term}"` : ''}
+                        ${!this.searchState.showAll ? ' | Hanya data completed' : ''}
+                        ${this.searchState.date ? ` | Tanggal: ${this.searchState.date}` : ''}
+                    </div>
+                </div>
+            ` : ''}
+        </div>
+
+        <div style="flex: 1; overflow-y: auto; min-height: 0; max-height: 80vh;">
+            <table class="compact-table">
+                <thead>
+                    <tr>
+                        <th style="width: 25px;">No</th>
+                        <th>Nomor Polisi</th>
+                        <th style="width: 120px;">Kelengkapan</th>
+                        <th style="width: 120px;">Status MRA</th>
+                        <!-- ✅ TAMBAHKAN KOLOM STATUS JIKA SHOW ALL -->
+                        ${showAllMode ? '<th style="width: 100px;">Status</th>' : ''}
+                    </tr>
+                </thead>
+                <tbody id="table-body-not-accept">
+                    ${this.renderNotAcceptTableRows(notAcceptData, showAllMode)}
+                </tbody>
+            </table>
+        </div>
+    </div>    <!-- Kanan -->
     <div style="flex: 4; display: flex; gap: 15px; min-width: 0; height: 100%; max-height: 80vh;">
 
         <!-- Panel kiri -->
@@ -2271,7 +2979,6 @@ word-break: break-word !important;
             this.attachNotAcceptEvents();
         }
 
-
         renderNotAcceptTableRows(data) {
             const displayData = this.filteredData && this.filteredData.length > 0 ? this.filteredData : data;
 
@@ -2283,38 +2990,70 @@ word-break: break-word !important;
                 const statusBadge = this.getMRAStatusBadge(estimasi.mra_status);
                 const { hasSparepart, hasService, sparepartCount, serviceCount } = this.checkEstimasiCompleteness(estimasi);
 
-                return `
-            <tr data-id="${estimasi.id}" style="cursor: pointer; background: ${estimasi.id === this.selectedId ? '#e3f2fd' : 'transparent'}; font-size: 14px;">
-                <td style="padding: 12px; text-align: center;">${index + 1}</td>
-                <td style="padding: 12px; font-weight: 500;">${estimasi.nopol || '-'}</td>
-                <td style="padding: 12px; text-align: center;">
-                    <div style="display: flex; justify-content: center; gap: 15px;">
-                        <!-- Marking Sparepart dengan Tooltip -->
-                        <div style="display: flex; flex-direction: column; align-items: center; gap: 4px; position: relative;"
-                             title="Sparepart: ${hasSparepart ? 'Lengkap' : 'Belum lengkap'} (${sparepartCount} item)">
-                            <div style="font-size: 10px; color: #666; font-weight: 500;">SPAREPART</div>
-                            <div style="width: 24px; height: 24px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
-                                      background: ${hasSparepart ? '#4caf50' : '#f44336'}; color: white; font-size: 14px; cursor: help;">
-                                ${hasSparepart ? '✓' : '✗'}
-                            </div>
-                            ${!hasSparepart ? '<div style="position: absolute; top: -5px; right: -5px; width: 8px; height: 8px; background: #ff9800; border-radius: 50%;"></div>' : ''}
-                        </div>
+                // Logika baru untuk menentukan warna dan status jasa
+                let jasaColor = '#f44336'; // Default merah (belum lengkap)
+                let jasaIcon = '✗';
+                let jasaTooltip = 'Jasa: Belum lengkap';
+                let jasaDot = '<div style="position: absolute; top: -5px; right: -5px; width: 8px; height: 8px; background: #ff9800; border-radius: 50%;"></div>';
 
-                        <!-- Marking Jasa dengan Tooltip -->
-                        <div style="display: flex; flex-direction: column; align-items: center; gap: 4px; position: relative;"
-                             title="Jasa: ${hasService ? 'Lengkap' : 'Belum lengkap'} (${serviceCount} item)">
-                            <div style="font-size: 10px; color: #666; font-weight: 500;">JASA</div>
-                            <div style="width: 24px; height: 24px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
-                                      background: ${hasService ? '#4caf50' : '#f44336'}; color: white; font-size: 14px; cursor: help;">
-                                ${hasService ? '✓' : '✗'}
-                            </div>
-                            ${!hasService ? '<div style="position: absolute; top: -5px; right: -5px; width: 8px; height: 8px; background: #ff9800; border-radius: 50%;"></div>' : ''}
+                if (hasService) {
+                    // Jika ada harga jasa dan bukan 0
+                    jasaColor = '#4caf50'; // Hijau
+                    jasaIcon = '✓';
+                    jasaTooltip = `Jasa: Lengkap (${serviceCount} item)`;
+                    jasaDot = '';
+                } else if (estimasi.status === 'completed') {
+                    // Jika status completed tapi harga jasa 0 atau tidak ada
+                    jasaColor = '#ff9800'; // Kuning
+                    jasaIcon = '✓';
+                    jasaTooltip = 'Jasa: Tidak ada jasa (harga 0)';
+                    jasaDot = '';
+                } else if (estimasi.status === 'sent') {
+                    // Jika status sent dan belum ada harga jasa
+                    jasaColor = '#f44336'; // Merah
+                    jasaIcon = '✗';
+                    jasaTooltip = 'Jasa: Menunggu input harga jasa';
+                    jasaDot = '<div style="position: absolute; top: -5px; right: -5px; width: 8px; height: 8px; background: #ff9800; border-radius: 50%;"></div>';
+                }
+
+                // Logika untuk sparepart (tetap sama)
+                const sparepartColor = hasSparepart ? '#4caf50' : '#f44336';
+                const sparepartIcon = hasSparepart ? '✓' : '✗';
+                const sparepartTooltip = `Sparepart: ${hasSparepart ? 'Lengkap' : 'Belum lengkap'} (${sparepartCount} item)`;
+                const sparepartDot = !hasSparepart ? '<div style="position: absolute; top: -5px; right: -5px; width: 8px; height: 8px; background: #ff9800; border-radius: 50%;"></div>' : '';
+
+                return `
+        <tr data-id="${estimasi.id}" style="cursor: pointer; background: ${estimasi.id === this.selectedId ? '#e3f2fd' : 'transparent'}; font-size: 14px;">
+            <td style="padding: 12px; text-align: center;">${index + 1}</td>
+            <td style="padding: 12px; font-weight: 500;">${estimasi.nopol || '-'}</td>
+            <td style="padding: 12px; text-align: center;">
+                <div style="display: flex; justify-content: center; gap: 15px;">
+                    <!-- Marking Sparepart dengan Tooltip -->
+                    <div style="display: flex; flex-direction: column; align-items: center; gap: 4px; position: relative;"
+                         title="${sparepartTooltip}">
+                        <div style="font-size: 10px; color: #666; font-weight: 500;">SPAREPART</div>
+                        <div style="width: 24px; height: 24px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+                                  background: ${sparepartColor}; color: white; font-size: 14px; cursor: help;">
+                            ${sparepartIcon}
                         </div>
+                        ${sparepartDot}
                     </div>
-                </td>
-                <td style="padding: 12px; text-align: center;">${statusBadge}</td>
-            </tr>
-        `;
+
+                    <!-- Marking Jasa dengan Tooltip -->
+                    <div style="display: flex; flex-direction: column; align-items: center; gap: 4px; position: relative;"
+                         title="${jasaTooltip}">
+                        <div style="font-size: 10px; color: #666; font-weight: 500;">JASA</div>
+                        <div style="width: 24px; height: 24px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+                                  background: ${jasaColor}; color: white; font-size: 14px; cursor: help; font-weight: bold;">
+                            ${jasaIcon}
+                        </div>
+                        ${jasaDot}
+                    </div>
+                </div>
+            </td>
+            <td style="padding: 12px; text-align: center;">${statusBadge}</td>
+        </tr>
+    `;
             }).join('');
         }
 
@@ -2939,30 +3678,6 @@ tunas TOYOTA Batu Tulis 🚗✨`;
             `;
         }
 
-        parseSpareparts(estimasi) {
-            if (!estimasi.sparepart_data) return [];
-            try {
-                const spareparts = typeof estimasi.sparepart_data === 'string'
-                ? JSON.parse(estimasi.sparepart_data)
-                : estimasi.sparepart_data;
-                return Array.isArray(spareparts) ? spareparts : [];
-            } catch (e) {
-                return [];
-            }
-        }
-
-        parseServices(estimasi) {
-            if (!estimasi.service_data) return [];
-            try {
-                const services = typeof estimasi.service_data === 'string'
-                ? JSON.parse(estimasi.service_data)
-                : estimasi.service_data;
-                return Array.isArray(services) ? services : [];
-            } catch (e) {
-                return [];
-            }
-        }
-
         calculateTotalAfterDiscount(estimasi) {
             const spareparts = this.parseSpareparts(estimasi);
             const services = this.parseServices(estimasi);
@@ -3012,10 +3727,80 @@ tunas TOYOTA Batu Tulis 🚗✨`;
             const config = statusConfig[status] || { color: '#666', text: 'Belum' };
             return `<span style="background: ${config.color}; color: white; padding: 4px 8px; border-radius: 10px; font-size: 12px; display: inline-block;">${config.text}</span>`;
         }
+
         attachNotAcceptEvents() {
-            // Row selection
-            document.querySelectorAll('#table-body-not-accept tr').forEach(row => {
-                row.addEventListener('click', () => {
+            console.log('🔧 Attaching search events...');
+
+            // ✅ PERBAIKAN: Gunakan event delegation yang stabil
+            const searchInput = document.getElementById('search-not-accept');
+            if (searchInput) {
+                console.log('✅ Search input found, attaching events...');
+
+                // Hapus event listeners lama jika ada
+                const newSearchInput = searchInput.cloneNode(true);
+                searchInput.parentNode.replaceChild(newSearchInput, searchInput);
+
+                // Pasang event listeners baru
+                newSearchInput.addEventListener('input', (e) => {
+                    console.log('🔍 Input event:', e.target.value);
+                    this.filterNotAcceptData(e.target.value);
+                });
+
+                newSearchInput.addEventListener('keydown', (e) => {
+                    if (e.key === 'Escape') {
+                        this.searchState.term = '';
+                        this.filterNotAcceptData('');
+                    }
+                });
+
+                // ✅ OTOMATIS FOKUS SETELAH RENDER
+                this.focusSearchInput();
+            }
+
+            // ✅ TOMBOL RESET FILTERS - TAMBAHKAN DEBUG
+            const resetFiltersBtn = document.getElementById('reset-filters');
+            if (resetFiltersBtn) {
+                console.log('✅ Reset button found');
+                resetFiltersBtn.addEventListener('click', () => {
+                    console.log('🔄 Reset button clicked');
+                    this.resetFilters();
+                });
+            } else {
+                console.log('❌ Reset button NOT found');
+            }
+
+            // ✅ TOMBOL TOGGLE SHOW ALL - TAMBAHKAN DEBUG
+            const toggleShowAllBtn = document.getElementById('toggle-show-all');
+            if (toggleShowAllBtn) {
+                console.log('✅ Toggle button found');
+                toggleShowAllBtn.addEventListener('click', () => {
+                    console.log('🔄 Toggle button clicked');
+                    this.toggleShowAll();
+                });
+            } else {
+                console.log('❌ Toggle button NOT found');
+            }
+
+            // Date filter
+            const dateFilter = document.getElementById('date-filter-not-accept');
+            if (dateFilter) {
+                if (!this.searchState.date) {
+                    const today = new Date();
+                    const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
+                    this.searchState.date = firstDay.toISOString().split('T')[0];
+                    dateFilter.value = this.searchState.date;
+                }
+
+                dateFilter.addEventListener('change', (e) => {
+                    this.searchState.date = e.target.value;
+                    this.filterNotAcceptByDate(e.target.value);
+                });
+            }
+
+            // Row selection dengan event delegation yang lebih baik
+            document.addEventListener('click', (e) => {
+                const row = e.target.closest('#table-body-not-accept tr');
+                if (row) {
                     document.querySelectorAll('#table-body-not-accept tr').forEach(r => {
                         r.style.background = 'transparent';
                     });
@@ -3027,29 +3812,10 @@ tunas TOYOTA Batu Tulis 🚗✨`;
                     currentEstimasiId = estimasiId;
                     this.customerDetail = null;
                     this.renderCurrentTab();
-                });
+                }
             });
 
-            // Search functionality - PERBAIKAN: Gunakan event input yang lebih responsif
-            const searchInput = document.getElementById('search-not-accept');
-            if (searchInput) {
-                // Clear previous event listeners
-                searchInput.oninput = null;
-                searchInput.onkeyup = null;
-
-                searchInput.addEventListener('input', (e) => {
-                    this.filterNotAcceptData(e.target.value);
-                });
-
-                // Tambahkan juga event keyup untuk handle clear (X) button
-                searchInput.addEventListener('keyup', (e) => {
-                    if (e.key === 'Escape') {
-                        searchInput.value = '';
-                        this.filterNotAcceptData('');
-                    }
-                });
-            }
-
+            // Manual diskon button
             const manualDiskonBtn = document.getElementById('manual-diskon-btn');
             if (manualDiskonBtn) {
                 manualDiskonBtn.addEventListener('click', () => {
@@ -3057,37 +3823,21 @@ tunas TOYOTA Batu Tulis 🚗✨`;
                 });
             }
 
-            // Date filter - PERBAIKAN: Handle change dan input event
-            const dateFilter = document.getElementById('date-filter-not-accept');
-            if (dateFilter) {
-                // Set default value ke tanggal 1 bulan ini
-                const today = new Date();
-                const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
-                dateFilter.value = firstDay.toISOString().split('T')[0];
-
-                dateFilter.addEventListener('change', () => {
-                    this.filterNotAcceptByDate(dateFilter.value);
-                });
-
-                dateFilter.addEventListener('input', () => {
-                    this.filterNotAcceptByDate(dateFilter.value);
-                });
-            }
-
-            // HANYA GUNAKAN DISKON DARI PANEL KIRI (Detail Customer & Estimasi)
+            // Diskont settings
             const discSparepartMid = document.getElementById('disc-sparepart-mid');
             const discJasaMid = document.getElementById('disc-jasa-mid');
 
             const updateDiskonSettings = () => {
                 this.diskonSettings.sparepart = parseInt(discSparepartMid?.value) || 0;
                 this.diskonSettings.jasa = parseInt(discJasaMid?.value) || 0;
-                this.renderCurrentTab(); // Render ulang semua tab termasuk template WhatsApp
+                this.renderCurrentTab();
             };
 
             if (discSparepartMid) {
                 discSparepartMid.addEventListener('change', updateDiskonSettings);
                 discSparepartMid.addEventListener('input', updateDiskonSettings);
             }
+
             if (discJasaMid) {
                 discJasaMid.addEventListener('change', updateDiskonSettings);
                 discJasaMid.addEventListener('input', updateDiskonSettings);
@@ -3095,9 +3845,6 @@ tunas TOYOTA Batu Tulis 🚗✨`;
 
             // Event untuk navigasi foto
             this.attachFotoEvents();
-
-            // Button events
-            this.attachButtonEvents();
         }
 
         attachButtonEvents() {
@@ -3507,45 +4254,74 @@ tunas TOYOTA Batu Tulis 🚗✨`;
         }
 
         filterNotAcceptData(searchTerm) {
-            // Filter hanya data dengan status 'completed'
-            const filtered = this.estimasiData.filter(estimasi =>
-                                                      estimasi.status === 'completed'
-                                                     );
+            console.log('🔍 Searching for:', searchTerm);
 
-            if (!searchTerm || searchTerm.trim() === '') {
-                this.filteredData = filtered;
-            } else {
-                const term = searchTerm.toLowerCase().trim();
-                this.filteredData = filtered.filter(estimasi =>
-                                                    (estimasi.nopol && estimasi.nopol.toLowerCase().includes(term)) ||
-                                                    (estimasi.name_customer && estimasi.name_customer.toLowerCase().includes(term)) ||
-                                                    (estimasi.jenis_mobil && estimasi.jenis_mobil.toLowerCase().includes(term)) ||
-                                                    (estimasi.nomor_rangka && estimasi.nomor_rangka.toLowerCase().includes(term))
-                                                   );
+            // SIMPAN STATE PENCARIAN
+            this.searchState.term = searchTerm;
+
+            // ✅ LOGIKA FILTER YANG LEBIH SEDERHANA:
+            // 1. Mulai dari data asli
+            let dataToFilter = [...this.originalData];
+
+            console.log('📋 Starting with all data:', dataToFilter.length);
+
+            // 2. Terapkan filter status HANYA JIKA showAll = false
+            if (!this.searchState.showAll) {
+                dataToFilter = dataToFilter.filter(estimasi =>
+                                                   estimasi.status === 'completed'
+                                                  );
+                console.log('📋 After status filter (completed only):', dataToFilter.length);
             }
 
-            this.renderCurrentTab();
+            // 3. Terapkan filter tanggal jika ada
+            if (this.searchState.date) {
+                const filterDate = new Date(this.searchState.date);
+                filterDate.setHours(0, 0, 0, 0);
+
+                dataToFilter = dataToFilter.filter(estimasi => {
+                    const estimasiDate = new Date(estimasi.created_at);
+                    estimasiDate.setHours(0, 0, 0, 0);
+                    return estimasiDate >= filterDate;
+                });
+                console.log('📅 After date filter:', dataToFilter.length);
+            }
+
+            // 4. Terapkan filter pencarian jika ada
+            if (searchTerm && searchTerm.trim() !== '') {
+                const term = searchTerm.toLowerCase().trim();
+                dataToFilter = dataToFilter.filter(estimasi =>
+                                                   (estimasi.nopol && estimasi.nopol.toLowerCase().includes(term)) ||
+                                                   (estimasi.name_customer && estimasi.name_customer.toLowerCase().includes(term)) ||
+                                                   (estimasi.jenis_mobil && estimasi.jenis_mobil.toLowerCase().includes(term)) ||
+                                                   (estimasi.nomor_rangka && estimasi.nomor_rangka.toLowerCase().includes(term)) ||
+                                                   (estimasi.telepon_customer && estimasi.telepon_customer.toLowerCase().includes(term))
+                                                  );
+                console.log('🔎 After search filter:', dataToFilter.length);
+            }
+
+            // ✅ OPTIMASI: Hanya render jika hasil berbeda
+            const shouldRender = JSON.stringify(this.filteredData) !== JSON.stringify(dataToFilter);
+
+            this.filteredData = dataToFilter;
+            console.log('📊 Final filtered results:', this.filteredData.length, 'Should render:', shouldRender);
+            console.log('👀 Show All mode:', this.searchState.showAll);
+
+            if (shouldRender) {
+                this.renderCurrentTab();
+            } else {
+                this.updateSearchInputValue();
+            }
         }
 
         filterNotAcceptByDate(date) {
-            const filtered = this.estimasiData.filter(estimasi =>
-                                                      estimasi.status === 'completed'
-                                                     );
+            console.log('📅 Filtering by date:', date);
 
-            if (!date) {
-                this.filteredData = filtered;
-            } else {
-                const filterDate = new Date(date);
-                filterDate.setHours(0, 0, 0, 0); // Set ke awal hari
+            // SIMPAN STATE TANGGAL
+            this.searchState.date = date;
 
-                this.filteredData = filtered.filter(estimasi => {
-                    const estimasiDate = new Date(estimasi.created_at);
-                    estimasiDate.setHours(0, 0, 0, 0); // Set ke awal hari
-                    return estimasiDate >= filterDate;
-                });
-            }
-
-            this.renderCurrentTab();
+            // ✅ PANGGIL filterNotAcceptData DENGAN TERM YANG ADA
+            // Ini akan menerapkan semua filter (status, tanggal, pencarian) secara berurutan
+            this.filterNotAcceptData(this.searchState.term);
         }
 
         // ... (methods untuk tab lainnya tetap sama)
@@ -3567,28 +4343,1540 @@ tunas TOYOTA Batu Tulis 🚗✨`;
                 font-size: 14px;
             `;
 
-    const colors = {
-        success: '#4caf50',
-        error: '#f44336',
-        info: '#2196f3',
-        warning: '#ff9800'
-    };
+            const colors = {
+                success: '#4caf50',
+                error: '#f44336',
+                info: '#2196f3',
+                warning: '#ff9800'
+            };
 
-    notification.style.background = colors[type] || colors.info;
-    notification.textContent = message;
+            notification.style.background = colors[type] || colors.info;
+            notification.textContent = message;
 
-    document.body.appendChild(notification);
+            document.body.appendChild(notification);
 
-    setTimeout(() => {
-        notification.style.opacity = '0';
-        notification.style.transform = 'translateX(100%)';
-        setTimeout(() => {
-            if (document.body.contains(notification)) {
-                document.body.removeChild(notification);
-            }
-        }, 300);
-    }, 3000);
+            setTimeout(() => {
+                notification.style.opacity = '0';
+                notification.style.transform = 'translateX(100%)';
+                setTimeout(() => {
+                    if (document.body.contains(notification)) {
+                        document.body.removeChild(notification);
+                    }
+                }, 300);
+            }, 3000);
+        }
+        // --- STYLE IOS (DIMODIFIKASI) ---
+        getIOSStyles() {
+            return `
+
+            <style>
+            /* Tambahkan di getIOSStyles() */
+.ios-input {
+    /* ... existing styles ... */
+    user-select: text !important; /* Pastikan text bisa diseleksi */
+    -webkit-user-select: text !important;
+    pointer-events: auto !important;
 }
+
+/* Prevent highlight on focus */
+.ios-input:focus {
+    outline: none;
+    background-color: rgba(118, 118, 128, 0.2);
+    /* Hilangkan outline biru di iOS */
+    -webkit-tap-highlight-color: transparent;
+    -webkit-appearance: none;
+}
+                /* Variables */
+                :root {
+                    --ios-bg: #F2F2F7;
+                    --ios-card-bg: #FFFFFF;
+                    --ios-blue: #007AFF;
+                    --ios-green: #34C759;
+                    --ios-red: #FF3B30;
+                    --ios-gray-text: #8E8E93;
+                    --ios-separator: #C6C6C8;
+                    --ios-input-bg: rgba(118, 118, 128, 0.12);
+                }
+
+                .ios-container {
+                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+                    background-color: var(--ios-bg);
+                    height: 100vh;
+                    display: flex;
+                    flex-direction: column;
+                    color: #000;
+                    overflow: hidden;
+                }
+
+                /* Toolbar */
+                .ios-toolbar {
+                    background-color: rgba(255, 255, 255, 0.8);
+                    backdrop-filter: blur(20px);
+                    -webkit-backdrop-filter: blur(20px);
+                    border-bottom: 1px solid rgba(0,0,0,0.1);
+                    padding: 12px 20px;
+                    display: flex;
+                    flex-wrap: wrap;
+                    gap: 15px;
+                    align-items: flex-end;
+                    justify-content: space-between;
+                    z-index: 10;
+                    flex-shrink: 0;
+                }
+
+                .ios-form-group {
+                    display: flex;
+                    flex-direction: column;
+                    gap: 5px;
+                }
+
+                .ios-label {
+                    font-size: 12px;
+                    font-weight: 600;
+                    color: var(--ios-gray-text);
+                    text-transform: uppercase;
+                    letter-spacing: 0.5px;
+                }
+
+                /* Inputs */
+                .ios-input-wrapper {
+                    position: relative;
+                    width: 240px;
+                }
+
+                .ios-input {
+                    background-color: var(--ios-input-bg);
+                    border: none;
+                    border-radius: 10px;
+                    padding: 8px 12px 8px 32px;
+                    font-size: 14px;
+                    width: 100%;
+                    box-sizing: border-box;
+                    color: #000;
+                    transition: background 0.2s;
+                }
+
+                .ios-input:focus {
+                    outline: none;
+                    background-color: rgba(118, 118, 128, 0.2);
+                }
+
+                .ios-input-icon {
+                    position: absolute;
+                    left: 8px;
+                    top: 50%;
+                    transform: translateY(-50%);
+                    color: var(--ios-gray-text);
+                    font-size: 16px;
+                }
+
+                .ios-date-input {
+                    background-color: var(--ios-input-bg);
+                    border: none;
+                    border-radius: 10px;
+                    padding: 7px 12px;
+                    font-size: 13px;
+                    color: #000;
+                    font-family: inherit;
+                }
+
+                /* Buttons */
+                .ios-btn {
+                    padding: 8px 16px;
+                    border-radius: 8px;
+                    font-size: 13px;
+                    font-weight: 600;
+                    border: none;
+                    cursor: pointer;
+                    display: flex;
+                    align-items: center;
+                    gap: 6px;
+                    transition: opacity 0.2s;
+                }
+
+                .ios-btn:active {
+                    opacity: 0.7;
+                }
+
+                .ios-btn-primary {
+                    background-color: var(--ios-blue);
+                    color: white;
+                }
+
+                .ios-btn-success {
+                    background-color: var(--ios-green);
+                    color: white;
+                }
+
+                /* Toggle Switch iOS Style */
+                .ios-toggle-wrapper {
+                    display: flex;
+                    align-items: center;
+                    cursor: pointer;
+                }
+
+                .ios-toggle-input {
+                    display: none;
+                }
+
+                .ios-toggle-slider {
+                    position: relative;
+                    width: 42px;
+                    height: 24px;
+                    background-color: #E9E9EA;
+                    border-radius: 24px;
+                    transition: .3s;
+                }
+
+                .ios-toggle-slider:before {
+                    position: absolute;
+                    content: "";
+                    height: 20px;
+                    width: 20px;
+                    left: 2px;
+                    bottom: 2px;
+                    background-color: white;
+                    border-radius: 50%;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+                    transition: .3s;
+                }
+
+                .ios-toggle-input:checked + .ios-toggle-slider {
+                    background-color: var(--ios-green);
+                }
+
+                .ios-toggle-input:checked + .ios-toggle-slider:before {
+                    transform: translateX(18px);
+                }
+
+                .ios-toggle-label {
+                    margin-left: 10px;
+                    font-size: 13px;
+                    font-weight: 500;
+                    color: #000;
+                }
+
+                /* Table Container yang di-scroll */
+                .ios-table-container {
+                    flex: 1;
+                    overflow: hidden;
+                    padding: 20px;
+                    height: calc(65vh - 90px); /* 70% tinggi layar dikurangi header */
+                }
+
+                .ios-card {
+                    background: var(--ios-card-bg);
+                    border-radius: 12px;
+                    box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+                    overflow: hidden;
+                    height: 100%;
+                    display: flex;
+                    flex-direction: column;
+                }
+
+                .ios-table-wrapper {
+                    overflow-y: auto;
+                    overflow-x: auto;
+                    flex: 1;
+                    height: 100%;
+                }
+
+                .ios-table {
+                    width: 100%;
+                    border-collapse: collapse;
+                    font-size: 13px;
+                    min-width: 1000px; /* Untuk memastikan semua kolom terlihat */
+                }
+
+                .ios-table th {
+                    background-color: rgba(249, 249, 249, 0.95);
+                    backdrop-filter: blur(10px);
+                    position: sticky;
+                    top: 0;
+                    text-align: left;
+                    padding: 12px 15px;
+                    border-bottom: 1px solid var(--ios-separator);
+                    color: var(--ios-gray-text);
+                    font-weight: 600;
+                    font-size: 11px;
+                    text-transform: uppercase;
+                    z-index: 5;
+                    cursor: pointer;
+                    user-select: none;
+                }
+
+                .ios-table th:hover {
+                    background-color: #f0f0f0;
+                }
+
+                .ios-table td {
+                    padding: 12px 15px;
+                    border-bottom: 1px solid #E5E5EA;
+                    color: #1C1C1E;
+                }
+
+                .ios-table tr:last-child td {
+                    border-bottom: none;
+                }
+
+                .ios-table tr:hover {
+                    background-color: #F2F2F7;
+                }
+
+                /* Badges */
+                .ios-badge {
+                    padding: 4px 8px;
+                    border-radius: 6px;
+                    font-size: 11px;
+                    font-weight: 600;
+                    display: inline-block;
+                }
+                .badge-acc { background: rgba(52, 199, 89, 0.15); color: var(--ios-green); }
+                .badge-blue { background: rgba(0, 122, 255, 0.15); color: var(--ios-blue); }
+                .badge-gray { background: rgba(142, 142, 147, 0.15); color: var(--ios-gray-text); }
+                .badge-red { background: rgba(255, 59, 48, 0.15); color: var(--ios-red); }
+
+                /* Action Icon */
+                .action-btn {
+                    background: none;
+                    border: none;
+                    color: var(--ios-blue);
+                    cursor: pointer;
+                    padding: 8px;
+                    border-radius: 6px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    transition: background 0.2s;
+                }
+                .action-btn:hover {
+                    background: rgba(0, 122, 255, 0.1);
+                }
+
+                /* Footer Info */
+                .ios-footer-info {
+                    padding: 10px 20px;
+                    text-align: right;
+                    font-size: 11px;
+                    color: var(--ios-gray-text);
+                    border-top: 1px solid #E5E5EA;
+                    background: var(--ios-card-bg);
+                    flex-shrink: 0;
+                }
+
+                /* Custom Scrollbar */
+                .ios-table-wrapper::-webkit-scrollbar {
+                    width: 8px;
+                    height: 8px;
+                }
+                .ios-table-wrapper::-webkit-scrollbar-track {
+                    background: #f1f1f1;
+                    border-radius: 4px;
+                }
+                .ios-table-wrapper::-webkit-scrollbar-thumb {
+                    background: #c1c1c1;
+                    border-radius: 4px;
+                }
+                .ios-table-wrapper::-webkit-scrollbar-thumb:hover {
+                    background: #a8a8a8;
+                }
+            </style>
+        `;
+        }
+
+        renderEstimasiACC(container) {
+            console.log('📱 Rendering iOS Styled Tab ACC');
+
+            // 1. Simpan nilai input sebelum render
+            const oldSearchValue = this.accState?.search || '';
+            const oldDateStart = this.accState?.dateStart || '';
+            const oldDateEnd = this.accState?.dateEnd || '';
+            const oldToggleState = this.accState?.onlyFollowedUp || false;
+
+            // 2. Inisialisasi State jika belum ada
+            if (!this.accState) {
+                this.accState = {
+                    search: '',
+                    dateStart: '',
+                    dateEnd: '',
+                    onlyFollowedUp: false,
+                    sortKey: 'created_at',
+                    sortOrder: 'desc'
+                };
+                // Default tanggal: awal bulan ini sampai akhir bulan ini
+                const date = new Date();
+                this.accState.dateStart = new Date(date.getFullYear(), date.getMonth(), 1).toISOString().split('T')[0];
+                this.accState.dateEnd = new Date(date.getFullYear(), date.getMonth() + 1, 0).toISOString().split('T')[0];
+            }
+
+            // 3. Restore nilai input jika ada
+            if (oldSearchValue !== '') this.accState.search = oldSearchValue;
+            if (oldDateStart !== '') this.accState.dateStart = oldDateStart;
+            if (oldDateEnd !== '') this.accState.dateEnd = oldDateEnd;
+            this.accState.onlyFollowedUp = oldToggleState;
+
+            // 4. Ambil data yang sudah difilter
+            const data = this.getAccFilteredData();
+
+            // 5. Render HTML dengan ID yang konsisten
+            container.innerHTML = `
+        ${this.getIOSStyles()}
+        <div class="ios-container">
+            <div class="ios-toolbar">
+                <div style="display: flex; gap: 15px; flex-wrap: wrap;">
+                    <div class="ios-form-group">
+                        <span class="ios-label">Pencarian</span>
+                        <div class="ios-input-wrapper">
+                            <i class="material-icons ios-input-icon">search</i>
+                            <input type="text" id="acc-search" class="ios-input"
+                                value="${this.accState.search}"
+                                placeholder="Nopol, Teknisi, Customer..."
+                                autocomplete="off">
+                        </div>
+                    </div>
+
+                    <div class="ios-form-group">
+                        <span class="ios-label">Dari</span>
+                        <input type="date" id="acc-date-start"
+                               class="ios-date-input"
+                               value="${this.accState.dateStart}"
+                               autocomplete="off">
+                    </div>
+                    <div class="ios-form-group">
+                        <span class="ios-label">Sampai</span>
+                        <input type="date" id="acc-date-end"
+                               class="ios-date-input"
+                               value="${this.accState.dateEnd}"
+                               autocomplete="off">
+                    </div>
+
+                    <div class="ios-form-group" style="justify-content: flex-end; padding-bottom: 5px;">
+                        <label class="ios-toggle-wrapper">
+                            <input type="checkbox" id="acc-followup-toggle" class="ios-toggle-input"
+                                ${this.accState.onlyFollowedUp ? 'checked' : ''}>
+                            <div class="ios-toggle-slider"></div>
+                            <span class="ios-toggle-label">Sudah Follow Up</span>
+                        </label>
+                    </div>
+                </div>
+
+                <div style="display: flex; gap: 10px;">
+                    <button id="btn-export-excel" class="ios-btn ios-btn-success">
+                        <i class="material-icons" style="font-size: 16px;">description</i> Excel
+                    </button>
+                    <button id="btn-report-tech" class="ios-btn ios-btn-primary">
+                        <i class="material-icons" style="font-size: 16px;">analytics</i> Laporan Teknisi
+                    </button>
+                </div>
+            </div>
+
+            <div class="ios-table-container">
+                <div class="ios-card">
+                    <div class="ios-table-wrapper">
+                        <table class="ios-table">
+                            <thead>
+                                <tr>
+                                    <th>No</th>
+                                    <th onclick="window.app.handleAccSort('nopol')">Nomor Polisi ${this.getSortIcon('nopol')}</th>
+                                    <th onclick="window.app.handleAccSort('name_customer')">Customer ${this.getSortIcon('name_customer')}</th>
+                                    <th>Telepon</th>
+                                    <th>Mobil</th>
+                                    <th onclick="window.app.handleAccSort('teknisi_name')">Teknisi ${this.getSortIcon('teknisi_name')}</th>
+                                    <th>SA</th>
+                                    <th onclick="window.app.handleAccSort('total_amount')">Total Estimasi ${this.getSortIcon('total_amount')}</th>
+                                    <th onclick="window.app.handleAccSort('created_at')">Tanggal ${this.getSortIcon('created_at')}</th>
+                                    <th>Status MRA</th>
+                                    <th style="text-align: center;">Detail</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${this.renderAccTableBody(data)}
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="ios-footer-info">
+                        Menampilkan <strong>${data.length}</strong> estimasi
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+
+            // 6. Pasang Event Listeners dengan debounce untuk search
+            this.attachAccEvents();
+        }
+
+        // --- HELPER UNTUK TAB ACC ---
+
+        getSortIcon(key) {
+            if (this.accState.sortKey !== key) return '';
+            return this.accState.sortOrder === 'asc' ? '↑' : '↓';
+        }
+
+        renderAccTableBody(data) {
+            if (data.length === 0) {
+                return `<tr><td colspan="11" style="text-align: center; padding: 40px; color: #8e8e93;">Tidak ada data ditemukan</td></tr>`;
+            }
+
+            return data.map((item, index) => {
+                const total = this.calculateTotalAmount(item);
+                const mraBadge = this.getMraStatusBadgeIOS(item.mra_status);
+
+                return `
+                <tr style="cursor: default;">
+                    <td>${index + 1}</td>
+                    <td style="font-weight: 600;">${item.nopol || '-'}</td>
+                    <td>${this.truncateText(item.name_customer, 20)}</td>
+                    <td style="color: #8E8E93;">${item.telepon_customer || '-'}</td>
+                    <td>${item.jenis_mobil || '-'}</td>
+                    <td>${item.teknisi_name || '-'}</td>
+                    <td>${item.service_advisor || '-'}</td>
+                    <td style="font-weight: 600; color: #34C759;">Rp ${total.toLocaleString('id-ID')}</td>
+                    <td style="color: #8E8E93;">${new Date(item.created_at).toLocaleDateString('id-ID')}</td>
+                    <td>${mraBadge}</td>
+                    <td style="text-align: center;">
+                        <button class="action-btn" onclick="window.app.handleDetailClick('${item.id}')" title="Lihat Detail">
+                            <i class="material-icons">visibility</i>
+                        </button>
+                    </td>
+                </tr>
+            `;
+            }).join('');
+        }
+
+        // Fungsi detail yang sudah difungsikan
+        handleDetailClick(id) {
+            console.log('Detail clicked for ID:', id);
+
+            // Cari data estimasi
+            const estimasi = this.estimasiData.find(e => e.id === id);
+            if (!estimasi) {
+                this.showNotification('Data estimasi tidak ditemukan', 'error');
+                return;
+            }
+
+            // Tampilkan modal detail atau navigasi ke halaman detail
+            this.showDetailModal(estimasi);
+        }
+
+        showDetailModal(estimasi) {
+            const total = this.calculateTotalAmount(estimasi);
+            const spareparts = this.parseSpareparts(estimasi);
+            const services = this.parseServices(estimasi);
+
+            const modalContent = `
+        <div style="padding: 20px; max-width: 800px; background: white; border-radius: 12px;">
+            <h2 style="margin-bottom: 20px; color: #007AFF;">Detail Estimasi</h2>
+
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px;">
+                <div>
+                    <h4 style="color: #8E8E93; margin-bottom: 5px;">Customer</h4>
+                    <p style="font-weight: 600;">${estimasi.name_customer || '-'}</p>
+                </div>
+                <div>
+                    <h4 style="color: #8E8E93; margin-bottom: 5px;">No. Polisi</h4>
+                    <p style="font-weight: 600;">${estimasi.nopol || '-'}</p>
+                </div>
+                <div>
+                    <h4 style="color: #8E8E93; margin-bottom: 5px;">Teknisi</h4>
+                    <p>${estimasi.teknisi_name || '-'}</p>
+                </div>
+                <div>
+                    <h4 style="color: #8E8E93; margin-bottom: 5px;">Service Advisor</h4>
+                    <p>${estimasi.service_advisor || '-'}</p>
+                </div>
+                <div>
+                    <h4 style="color: #8E8E93; margin-bottom: 5px;">Total Estimasi</h4>
+                    <p style="color: #34C759; font-weight: 600;">Rp ${total.toLocaleString('id-ID')}</p>
+                </div>
+                <div>
+                    <h4 style="color: #8E8E93; margin-bottom: 5px;">Status MRA</h4>
+                    ${this.getMraStatusBadgeIOS(estimasi.mra_status)}
+                </div>
+            </div>
+
+            <div style="margin-bottom: 20px;">
+                <h4 style="color: #8E8E93; margin-bottom: 10px;">Spareparts</h4>
+                ${spareparts.length > 0 ?
+                  spareparts.map(p => `
+                        <div style="display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #eee;">
+                            <span>${p.name || '-'}</span>
+                            <span>${p.qty || 1} x Rp ${(p.price || 0).toLocaleString('id-ID')}</span>
+                        </div>
+                    `).join('') :
+            '<p style="color: #8E8E93;">Tidak ada spareparts</p>'
+            }
+            </div>
+
+            <div style="margin-bottom: 20px;">
+                <h4 style="color: #8E8E93; margin-bottom: 10px;">Services</h4>
+                ${services.length > 0 ?
+                  services.map(s => `
+                        <div style="display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #eee;">
+                            <span>${s.name || '-'}</span>
+                            <span>${s.hour || 1} jam x Rp ${(s.price || 0).toLocaleString('id-ID')}</span>
+                        </div>
+                    `).join('') :
+            '<p style="color: #8E8E93;">Tidak ada services</p>'
+            }
+            </div>
+
+            <div style="text-align: right;">
+                <button onclick="this.closest('.modal').remove()" style="padding: 8px 16px; background: #007AFF; color: white; border: none; border-radius: 8px; cursor: pointer;">Tutup</button>
+            </div>
+        </div>
+    `;
+
+            // Buat modal
+            const modal = document.createElement('div');
+            modal.className = 'modal';
+            modal.style.cssText = `
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0,0,0,0.5);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 1000;
+    `;
+            modal.innerHTML = modalContent;
+            document.body.appendChild(modal);
+
+            // Close modal saat klik di luar
+            modal.addEventListener('click', (e) => {
+                if (e.target === modal) {
+                    modal.remove();
+                }
+            });
+        }
+
+        getMraStatusBadgeIOS(status) {
+            const map = {
+                'accepted': { label: 'ACC', class: 'badge-acc' },
+                'interested': { label: 'Tertarik', class: 'badge-blue' },
+                'contacted': { label: 'Dihubungi', class: 'badge-blue' },
+                'not_interested': { label: 'Tdk Tertarik', class: 'badge-red' },
+                'pending': { label: 'Pending', class: 'badge-gray' }
+            };
+            const conf = map[status] || map['pending'];
+            return `<span class="ios-badge ${conf.class}">${conf.label}</span>`;
+        }
+
+        getAccFilteredData() {
+            let data = [...this.estimasiData];
+
+            // 1. Filter Search
+            if (this.accState.search) {
+                const term = this.accState.search.toLowerCase();
+                data = data.filter(item =>
+                                   (item.nopol && item.nopol.toLowerCase().includes(term)) ||
+                                   (item.name_customer && item.name_customer.toLowerCase().includes(term)) ||
+                                   (item.teknisi_name && item.teknisi_name.toLowerCase().includes(term)) ||
+                                   (item.service_advisor && item.service_advisor.toLowerCase().includes(term))
+                                  );
+            }
+
+            // 2. Filter Date
+            if (this.accState.dateStart && this.accState.dateEnd) {
+                const start = new Date(this.accState.dateStart);
+                const end = new Date(this.accState.dateEnd);
+                end.setHours(23, 59, 59);
+                data = data.filter(item => {
+                    const itemDate = new Date(item.created_at);
+                    return itemDate >= start && itemDate <= end;
+                });
+            }
+
+            // 3. Filter Only Followed Up
+            if (this.accState.onlyFollowedUp) {
+                data = data.filter(item =>
+                                   item.mra_status &&
+                                   item.mra_status !== 'pending' &&
+                                   item.mra_status !== ''
+                                  );
+            }
+
+            // 4. Sorting
+            data.sort((a, b) => {
+                let valA = a[this.accState.sortKey] || '';
+                let valB = b[this.accState.sortKey] || '';
+
+                if (this.accState.sortKey === 'total_amount') {
+                    valA = this.calculateTotalAmount(a);
+                    valB = this.calculateTotalAmount(b);
+                }
+
+                if (valA < valB) return this.accState.sortOrder === 'asc' ? -1 : 1;
+                if (valA > valB) return this.accState.sortOrder === 'asc' ? 1 : -1;
+                return 0;
+            });
+
+            return data;
+        }
+
+        calculateTotalAmount(item) {
+            let total = 0;
+            const spareparts = this.parseSpareparts(item);
+            const services = this.parseServices(item);
+            spareparts.forEach(p => total += (p.price || 0) * (p.qty || 1));
+            services.forEach(s => total += (s.price || 0) * (s.hour || 1));
+            return total;
+        }
+
+        handleAccSort(key) {
+            if (this.accState.sortKey === key) {
+                this.accState.sortOrder = this.accState.sortOrder === 'asc' ? 'desc' : 'asc';
+            } else {
+                this.accState.sortKey = key;
+                this.accState.sortOrder = 'asc';
+            }
+            this.renderAccTabWithoutFocusLoss(); // Ganti dari render langsung
+        }
+
+        attachAccEvents() {
+            // Debounce function untuk search
+            const debounce = (func, delay) => {
+                let timeoutId;
+                return (...args) => {
+                    clearTimeout(timeoutId);
+                    timeoutId = setTimeout(() => {
+                        func.apply(this, args);
+                    }, delay);
+                };
+            };
+
+            // Search dengan debounce 300ms
+            const searchInput = document.getElementById('acc-search');
+            if (searchInput) {
+                // Simpan posisi cursor dan selection
+                let cursorPosition = searchInput.selectionStart;
+                let searchValue = searchInput.value;
+
+                // Gunakan debounce untuk menghindari re-render terlalu cepat
+                const handleSearchInput = debounce((e) => {
+                    this.accState.search = e.target.value;
+                    this.renderAccTabWithoutFocusLoss();
+                }, 300);
+
+                searchInput.addEventListener('input', (e) => {
+                    // Simpan posisi cursor sebelum debounce
+                    cursorPosition = e.target.selectionStart;
+                    searchValue = e.target.value;
+
+                    handleSearchInput(e);
+                });
+
+                // Focus kembali setelah render (jika ada)
+                searchInput.focus();
+                if (cursorPosition >= 0) {
+                    searchInput.setSelectionRange(cursorPosition, cursorPosition);
+                }
+            }
+
+            // Date Filters
+            const dateStartInput = document.getElementById('acc-date-start');
+            if (dateStartInput) {
+                dateStartInput.addEventListener('change', (e) => {
+                    this.accState.dateStart = e.target.value;
+                    this.renderAccTabWithoutFocusLoss();
+                });
+            }
+
+            const dateEndInput = document.getElementById('acc-date-end');
+            if (dateEndInput) {
+                dateEndInput.addEventListener('change', (e) => {
+                    this.accState.dateEnd = e.target.value;
+                    this.renderAccTabWithoutFocusLoss();
+                });
+            }
+
+            // Toggle Follow Up
+            const toggleInput = document.getElementById('acc-followup-toggle');
+            if (toggleInput) {
+                toggleInput.addEventListener('change', (e) => {
+                    this.accState.onlyFollowedUp = e.target.checked;
+                    this.renderAccTabWithoutFocusLoss();
+                });
+            }
+
+            // Buttons
+            const exportExcelBtn = document.getElementById('btn-export-excel');
+            if (exportExcelBtn) {
+                exportExcelBtn.addEventListener('click', () => this.exportAccToExcel());
+            }
+
+            const reportTechBtn = document.getElementById('btn-report-tech');
+            if (reportTechBtn) {
+                reportTechBtn.addEventListener('click', () => this.generateTechnicianReport());
+            }
+        }
+
+        // Method baru untuk render tab ACC tanpa kehilangan fokus
+        renderAccTabWithoutFocusLoss() {
+            // Debounce multiple rapid renders
+            if (this.accRenderPending) return;
+
+            this.accRenderPending = true;
+
+            requestAnimationFrame(() => {
+                // Simpan active element sebelum render
+                const activeElement = document.activeElement;
+                const activeId = activeElement?.id;
+                const cursorPosition = activeElement?.selectionStart;
+                const inputValue = activeElement?.value;
+
+                // Render tab
+                this.renderEstimasiACC(document.getElementById('content-container'));
+
+                // Setelah render, fokus kembali
+                if (activeId) {
+                    setTimeout(() => {
+                        const newElement = document.getElementById(activeId);
+                        if (newElement) {
+                            newElement.focus();
+
+                            if (newElement.tagName === 'INPUT' || newElement.tagName === 'TEXTAREA') {
+                                if (inputValue !== undefined) {
+                                    // Hanya update value jika berbeda (untuk menghindari flicker)
+                                    if (newElement.value !== inputValue) {
+                                        newElement.value = inputValue;
+                                    }
+                                }
+                                if (cursorPosition !== undefined && cursorPosition >= 0) {
+                                    newElement.setSelectionRange(cursorPosition, cursorPosition);
+                                }
+                            }
+                        }
+                        this.accRenderPending = false;
+                    }, 50);
+                } else {
+                    this.accRenderPending = false;
+                }
+            });
+        }
+
+        exportAccToExcel() {
+            const data = this.getAccFilteredData();
+            if (data.length === 0) {
+                this.showNotification('Tidak ada data untuk diexport', 'warning');
+                return;
+            }
+
+            const excelData = data.map((item, index) => {
+                const spareparts = this.parseSpareparts(item);
+                const services = this.parseServices(item);
+
+                let priceSparepart = 0;
+                let priceService = 0;
+                const componentList = [];
+                const replacedParts = [];
+                const selectedIndices = item.mra_selected_spareparts || [];
+
+                spareparts.forEach((p, idx) => {
+                    priceSparepart += (p.price || 0) * (p.qty || 1);
+                    componentList.push(`[Part] ${p.name}`);
+                    if (selectedIndices.includes(idx)) replacedParts.push(p.name);
+                });
+
+                services.forEach(s => {
+                    priceService += (s.price || 0) * (s.hour || 1);
+                    componentList.push(`[Jasa] ${s.name}`);
+                });
+
+                return {
+                    "No": index + 1,
+                    "No Polisi": item.nopol,
+                    "Nama Customer": item.name_customer,
+                    "No Telepon": item.telepon_customer,
+                    "Jenis Mobil": item.jenis_mobil,
+                    "No Rangka": item.nomor_rangka,
+                    "Teknisi": item.teknisi_name,
+                    "Service Advisor": item.service_advisor,
+                    "Komponen": componentList.join(', '),
+                    "Harga Sparepart": priceSparepart,
+                    "Harga Jasa": priceService,
+                    "Total Estimasi": priceSparepart + priceService,
+                    "Tanggal": new Date(item.created_at).toLocaleDateString('id-ID'),
+                    "Keterangan": item.keterangan,
+                    "Status Estimasi": item.status,
+                    "MRA Status": item.mra_status,
+                    "Catatan MRA": item.mra_catatan,
+                    "Part Diganti (ACC)": replacedParts.join(', ')
+                };
+            });
+
+            const ws = XLSX.utils.json_to_sheet(excelData);
+            // Style lebar kolom otomatis sederhana
+            const wscols = Object.keys(excelData[0]).map(k => ({ wch: 20 }));
+            wscols[8] = { wch: 50 };
+            ws['!cols'] = wscols;
+
+            const wb = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(wb, ws, "Data Estimasi");
+            XLSX.writeFile(wb, `Laporan_Estimasi_MRA_${new Date().toISOString().split('T')[0]}.xlsx`);
+            this.showNotification('Excel berhasil didownload!', 'success');
+        }
+
+        // Fungsi Laporan Teknisi yang dimodifikasi
+        generateTechnicianReport() {
+            console.log('=== MULAI GENERATE LAPORAN 2 TABEL ===');
+
+            const data = this.getAccFilteredData();
+            console.log('1. Data estimasi:', data.length, 'records');
+
+            // ===== DEBUG: CEK SUMBER DATA USERS =====
+            console.log('\n2. DEBUG DATA SOURCE:');
+            console.log('this.users ada?', !!this.users);
+            console.log('this.users array?', Array.isArray(this.users));
+            console.log('this.users length:', this.users?.length || 0);
+
+            // Coba beberapa sumber data users
+            let allUsers = [];
+
+            // Sumber 1: this.users
+            if (this.users && Array.isArray(this.users) && this.users.length > 0) {
+                console.log('Menggunakan this.users');
+                allUsers = this.users;
+            }
+            // Sumber 2: Global variable atau window property
+            else if (window.users && Array.isArray(window.users) && window.users.length > 0) {
+                console.log('Menggunakan window.users');
+                allUsers = window.users;
+            }
+            // Sumber 3: localStorage atau sessionStorage
+            else {
+                try {
+                    const storedUsers = localStorage.getItem('users');
+                    if (storedUsers) {
+                        const parsed = JSON.parse(storedUsers);
+                        if (Array.isArray(parsed) && parsed.length > 0) {
+                            console.log('Menggunakan localStorage users');
+                            allUsers = parsed;
+                        }
+                    }
+                } catch (e) {
+                    console.log('Tidak ada data users di localStorage');
+                }
+            }
+
+            // Jika masih kosong, buat data dummy untuk testing
+            if (allUsers.length === 0) {
+                console.log('WARNING: Data users kosong! Menggunakan data dummy');
+
+                // Data dummy berdasarkan log Anda sebelumnya
+                allUsers = [
+                    { id: '1', email: 'dzaky@example.com', full_name: 'AHMAD DZAKY ALFAARISI', role: 'teknisi' },
+                    { id: '2', email: 'syafiq@example.com', full_name: 'AHMAD SYAFIQ AL-ABANI', role: 'teknisi' },
+                    { id: '3', email: 'alif@example.com', full_name: 'Alif Fadhilah', role: 'teknisi' },
+                    { id: '4', email: 'arya@example.com', full_name: 'Arya Prinanta', role: 'teknisi' },
+                    { id: '5', email: 'daffa@example.com', full_name: "DAFFA' RIZQ RAMADAN", role: 'teknisi' },
+                    { id: '6', email: 'faisal@example.com', full_name: 'Faisal', role: 'teknisi' },
+                    { id: '7', email: 'ferdy@example.com', full_name: 'Ferdy Febrian', role: 'teknisi' },
+                    { id: '8', email: 'heychal@example.com', full_name: 'Heychal Masyura', role: 'teknisi' },
+                    { id: '9', email: 'ikhwan@example.com', full_name: 'Ikhwan Fikri Fadilah', role: 'teknisi' },
+                    { id: '10', email: 'ilham@example.com', full_name: 'Ilham Riyadi', role: 'teknisi' },
+                    { id: '11', email: 'fadli@example.com', full_name: 'Mochammad Fadli Falevi', role: 'teknisi' },
+                    { id: '12', email: 'kevin@example.com', full_name: 'Muhammad Kevin Mapaji', role: 'teknisi' },
+                    { id: '13', email: 'imam@example.com', full_name: 'Mukhsoni imam', role: 'teknisi' },
+                    { id: '14', email: 'radityo@example.com', full_name: 'Radityo triandi', role: 'teknisi' },
+                    { id: '15', email: 'rafi@example.com', full_name: 'RAFI ABI RIZQULLOH', role: 'teknisi' },
+                    { id: '16', email: 'rahmat@example.com', full_name: 'Rahmat Pahruzi', role: 'teknisi' },
+                    { id: '17', email: 'ridho@example.com', full_name: 'Ridho Wahyu Romadon', role: 'teknisi' }
+                ];
+            }
+
+            console.log('3. Data users yang digunakan:', allUsers.length, 'records');
+            console.log('Contoh 3 data pertama:');
+            allUsers.slice(0, 3).forEach((user, i) => {
+                console.log(`   ${i+1}. ID: ${user.id}, Name: "${user.full_name}", Email: ${user.email}, Role: ${user.role}`);
+            });
+
+            // Blacklist teknisi
+            const blacklist = ['Faisal', 'Mukhsoni imam', 'Radityo triandi'];
+
+            // === 1. PROSES DATA ESTIMASI UNTUK TABEL PERTAMA ===
+            console.log('\n4. PROSES DATA ESTIMASI');
+            const estimasiStats = {};
+            const teknisiFromEstimasi = new Set();
+
+            data.forEach((item) => {
+                const techName = (item.teknisi_name || '').trim();
+
+                if (!techName || techName.toLowerCase() === 'null') {
+                    return;
+                }
+
+                // Cek blacklist
+                const isBlacklisted = blacklist.some(b =>
+                                                     techName.toLowerCase().includes(b.toLowerCase())
+                                                    );
+
+                if (isBlacklisted) {
+                    return;
+                }
+
+                // Simpan nama untuk tracking
+                teknisiFromEstimasi.add(techName.toLowerCase());
+
+                // Proses data estimasi
+                if (!estimasiStats[techName]) {
+                    estimasiStats[techName] = {
+                        name: techName,
+                        count: 0,
+                        revenue: 0,
+                        potential: 0,
+                        acceptedCount: 0,
+                        source: 'estimasi'
+                    };
+                }
+
+                const total = this.calculateTotalAmount(item);
+                estimasiStats[techName].count++;
+                estimasiStats[techName].potential += total;
+
+                if (item.mra_status === 'accepted') {
+                    estimasiStats[techName].revenue += total;
+                    estimasiStats[techName].acceptedCount++;
+                }
+            });
+
+            const estimasiArray = Object.values(estimasiStats);
+            console.log('Teknisi dari estimasi:', estimasiArray.length);
+
+            // === 2. PROSES DATA USERS UNTUK TABEL KEDUA ===
+            console.log('\n5. PROSES DATA USERS UNTUK TABEL 2');
+
+            // Filter hanya teknisi
+            const teknisiUsers = allUsers.filter(user => {
+                const role = (user.role || '').toLowerCase();
+                return role === 'teknisi';
+            });
+
+            console.log('Total users dengan role "teknisi":', teknisiUsers.length);
+
+            // Hanya ambil teknisi yang TIDAK ADA di estimasi
+            const usersWithoutEstimasi = [];
+            const usersWithEstimasi = []; // Untuk tracking saja
+
+            teknisiUsers.forEach((user) => {
+                const fullName = (user.full_name || user.name || '').trim();
+
+                if (!fullName) {
+                    return;
+                }
+
+                // Cek blacklist
+                const isBlacklisted = blacklist.some(b =>
+                                                     fullName.toLowerCase().includes(b.toLowerCase())
+                                                    );
+
+                if (isBlacklisted) {
+                    return;
+                }
+
+                // Cek apakah user ini ada di tabel estimasi
+                const isInEstimasi = teknisiFromEstimasi.has(fullName.toLowerCase());
+
+                if (isInEstimasi) {
+                    usersWithEstimasi.push({
+                        id: user.id,
+                        name: fullName,
+                        email: user.email || '-',
+                        role: user.role || '-'
+                    });
+                } else {
+                    // Hanya tambahkan jika TIDAK ADA di estimasi
+                    usersWithoutEstimasi.push({
+                        id: user.id,
+                        name: fullName,
+                        email: user.email || '-',
+                        role: user.role || '-',
+                        count: 0,
+                        potential: 0,
+                        acceptedCount: 0,
+                        contribution: 0
+                    });
+                }
+            });
+
+            // Urutkan berdasarkan nama
+            const sortedUsersWithoutEstimasi = usersWithoutEstimasi.sort((a, b) => a.name.localeCompare(b.name));
+            console.log('Teknisi TANPA estimasi (untuk tabel 2):', sortedUsersWithoutEstimasi.length);
+            console.log('Teknisi DENGAN estimasi:', usersWithEstimasi.length);
+
+            // === 3. PERHITUNGAN UNTUK TABEL 1 ===
+            console.log('\n6. PERHITUNGAN KONTRIBUSI');
+
+            const totalPotensi = estimasiArray.reduce((acc, curr) => acc + curr.potential, 0);
+            console.log('Total potensi:', totalPotensi);
+
+            estimasiArray.forEach(stat => {
+                if (totalPotensi > 0) {
+                    stat.contribution = (stat.potential / totalPotensi) * 100;
+                } else {
+                    stat.contribution = 0;
+                }
+            });
+
+            // Urutkan dan beri ranking
+            const sortedEstimasi = estimasiArray.sort((a, b) => b.potential - a.potential);
+            sortedEstimasi.forEach((stat, index) => {
+                stat.rank = index + 1;
+            });
+
+            // === 4. BUAT TABEL PDF ===
+            console.log('\n7. MEMBUAT TABEL PDF');
+
+            const docDefinition = {
+                pageSize: 'A4',
+                pageMargins: [40, 40, 40, 40],
+                header: {
+                    text: 'LAPORAN TEKNISI CR7',
+                    alignment: 'center',
+                    margin: [0, 15, 0, 0],
+                    fontSize: 14,
+                    bold: true,
+                    color: '#007AFF'
+                },
+                content: [
+                    {
+                        text: `Periode: ${this.accState.dateStart} s/d ${this.accState.dateEnd}`,
+                        alignment: 'center',
+                        margin: [0, 0, 0, 20],
+                        fontSize: 10,
+                        color: '#8E8E93'
+                    },
+
+                    // ===== TABEL 1: TEKNISI DENGAN KONTRIBUSI =====
+                    {
+                        text: 'PERFORMANSI TEKNISI (BERDASARKAN ESTIMASI)',
+                        bold: true,
+                        fontSize: 11,
+                        margin: [0, 0, 0, 10],
+                        color: '#007AFF'
+                    },
+                    {
+                        table: {
+                            headerRows: 1,
+                            widths: ['auto', '*', 'auto', 'auto', 'auto', 'auto'],
+                            body: [
+                                [
+                                    { text: 'Rank', fillColor: '#F2F2F7', bold: true, fontSize: 9, alignment: 'center' },
+                                    { text: 'Nama Teknisi', fillColor: '#F2F2F7', bold: true, fontSize: 9 },
+                                    { text: 'Jml Estimasi', fillColor: '#F2F2F7', bold: true, alignment: 'center', fontSize: 9 },
+                                    { text: 'Estimasi ACC', fillColor: '#F2F2F7', bold: true, alignment: 'center', fontSize: 9 },
+                                    { text: 'Total Potensi (Rp)', fillColor: '#F2F2F7', bold: true, alignment: 'right', fontSize: 9 },
+                                    { text: 'Kontribusi', fillColor: '#F2F2F7', bold: true, alignment: 'right', fontSize: 9 }
+                                ],
+                                ...sortedEstimasi.map(stat => {
+                                    const contributionText = `${stat.contribution.toFixed(1)}%`;
+                                    const rankBadge = this.getRankBadge(stat.rank);
+
+                                    return [
+                                        rankBadge,
+                                        { text: stat.name, fontSize: 9 },
+                                        { text: stat.count, alignment: 'center', fontSize: 9 },
+                                        { text: stat.acceptedCount, alignment: 'center', fontSize: 9 },
+                                        {
+                                            text: stat.potential.toLocaleString('id-ID'),
+                                            alignment: 'right',
+                                            fontSize: 9
+                                        },
+                                        {
+                                            text: contributionText,
+                                            alignment: 'right',
+                                            fontSize: 9,
+                                            color: stat.contribution > 10 ? '#34C759' :
+                                            stat.contribution > 5 ? '#FF9500' :
+                                            stat.contribution > 0 ? '#FF3B30' : '#8E8E93',
+                                            bold: true
+                                        }
+                                    ];
+                                }),
+                                [
+                                    {
+                                        text: 'TOTAL',
+                                        colSpan: 2,
+                                        bold: true,
+                                        fillColor: '#E5E5EA',
+                                        fontSize: 9
+                                    },
+                                    { text: '', fillColor: '#E5E5EA' },
+                                    {
+                                        text: sortedEstimasi.reduce((a, b) => a + b.count, 0),
+                                        bold: true,
+                                        alignment: 'center',
+                                        fillColor: '#E5E5EA',
+                                        fontSize: 9
+                                    },
+                                    {
+                                        text: sortedEstimasi.reduce((a, b) => a + b.acceptedCount, 0),
+                                        bold: true,
+                                        alignment: 'center',
+                                        fillColor: '#E5E5EA',
+                                        fontSize: 9
+                                    },
+                                    {
+                                        text: totalPotensi.toLocaleString('id-ID'),
+                                        bold: true,
+                                        alignment: 'right',
+                                        fillColor: '#E5E5EA',
+                                        fontSize: 9
+                                    },
+                                    {
+                                        text: '100%',
+                                        bold: true,
+                                        alignment: 'right',
+                                        fillColor: '#E5E5EA',
+                                        fontSize: 9
+                                    }
+                                ]
+                            ]
+                        },
+                        layout: {
+                            hLineWidth(i, node) {
+                                return (i === 0 || i === node.table.body.length - 1) ? 1 : 0.5;
+                            },
+                            vLineWidth() { return 0.5; },
+                            hLineColor() { return '#E5E5EA'; },
+                            vLineColor() { return '#E5E5EA'; }
+                        },
+                        margin: [0, 0, 0, 30]
+                    },
+
+                    // ===== TABEL 2: TEKNISI BELUM KONTRIBUSI =====
+                    {
+                        text: 'TEKNISI BELUM KONTRIBUSI CR7',
+                        bold: true,
+                        fontSize: 11,
+                        margin: [0, 20, 0, 10],
+                        color: '#FF3B30'
+                    },
+                    {
+                        table: {
+                            headerRows: 1,
+                            widths: ['auto', '*', 'auto', 'auto', 'auto'],
+                            body: [
+                                [
+                                    { text: 'No', fillColor: '#FFE5E5', bold: true, fontSize: 9, alignment: 'center', color: '#FF3B30' },
+                                    { text: 'Nama Teknisi', fillColor: '#FFE5E5', bold: true, fontSize: 9, color: '#FF3B30' },
+                                    { text: 'Jml Estimasi', fillColor: '#FFE5E5', bold: true, alignment: 'center', fontSize: 9, color: '#FF3B30' },
+                                    { text: 'Total Potensi (Rp)', fillColor: '#FFE5E5', bold: true, alignment: 'right', fontSize: 9, color: '#FF3B30' },
+                                    { text: 'Kontribusi', fillColor: '#FFE5E5', bold: true, alignment: 'right', fontSize: 9, color: '#FF3B30' }
+                                ],
+                                // Hanya teknisi yang belum berkontribusi
+                                ...(sortedUsersWithoutEstimasi.length > 0
+                                    ? sortedUsersWithoutEstimasi.map((user, index) => [
+                                    {
+                                        text: (index + 1).toString(),
+                                        fontSize: 9,
+                                        alignment: 'center',
+                                        color: '#8E8E93'
+                                    },
+                                    {
+                                        text: user.name,
+                                        fontSize: 9,
+                                        color: '#8E8E93',
+                                        italics: true
+                                    },
+                                    {
+                                        text: '0',
+                                        alignment: 'center',
+                                        fontSize: 9,
+                                        color: '#8E8E93'
+                                    },
+                                    {
+                                        text: '0',
+                                        alignment: 'right',
+                                        fontSize: 9,
+                                        color: '#8E8E93'
+                                    },
+                                    {
+                                        text: '0%',
+                                        alignment: 'right',
+                                        fontSize: 9,
+                                        color: '#C7C7CC',
+                                        italics: true
+                                    }
+                                ])
+                                    : [[
+                                        {
+                                            text: 'SEMUA TEKNISI SUDAH BERKONTRIBUSI',
+                                            colSpan: 5,
+                                            alignment: 'center',
+                                            fontSize: 9,
+                                            color: '#34C759',
+                                            italics: true,
+                                            bold: true
+                                        },
+                                        '', '', '', ''
+                                    ]]
+                                   ),
+                                // Baris TOTAL untuk tabel 2
+                                [
+                                    {
+                                        text: 'TOTAL',
+                                        colSpan: 2,
+                                        bold: true,
+                                        fillColor: '#FFE5E5',
+                                        fontSize: 9,
+                                        color: '#FF3B30'
+                                    },
+                                    { text: '', fillColor: '#FFE5E5' },
+                                    {
+                                        text: '0',
+                                        bold: true,
+                                        alignment: 'center',
+                                        fillColor: '#FFE5E5',
+                                        fontSize: 9,
+                                        color: '#FF3B30'
+                                    },
+                                    {
+                                        text: '0',
+                                        bold: true,
+                                        alignment: 'right',
+                                        fillColor: '#FFE5E5',
+                                        fontSize: 9,
+                                        color: '#FF3B30'
+                                    },
+                                    {
+                                        text: '0%',
+                                        bold: true,
+                                        alignment: 'right',
+                                        fillColor: '#FFE5E5',
+                                        fontSize: 9,
+                                        color: '#FF3B30'
+                                    }
+                                ]
+                            ]
+                        },
+                        layout: {
+                            hLineWidth(i, node) {
+                                return (i === 0 || i === node.table.body.length - 1) ? 1 : 0.5;
+                            },
+                            vLineWidth() { return 0.5; },
+                            hLineColor() { return '#FFCCCC'; },
+                            vLineColor() { return '#FFCCCC'; }
+                        },
+                        margin: [0, 0, 0, 10]
+                    },
+
+                    // ===== RINGKASAN =====
+                    {
+                        columns: [
+                            {
+                                width: '50%',
+                                text: [
+                                    { text: 'Ringkasan Tabel 1:\n', bold: true, fontSize: 9 },
+                                    `• Periode: ${this.accState.dateStart} s/d ${this.accState.dateEnd}\n`,
+                                    `• Teknisi berkontribusi: ${sortedEstimasi.length}\n`,
+                                    `• Total estimasi: ${sortedEstimasi.reduce((a, b) => a + b.count, 0)}\n`,
+                                    `• Total potensi: Rp ${totalPotensi.toLocaleString('id-ID')}`
+                        ],
+                                fontSize: 8,
+                                color: '#007AFF'
+                            },
+                            {
+                                width: '50%',
+                                text: [
+                                    { text: 'Ringkasan Tabel 2:\n', bold: true, fontSize: 9 },
+                                    `• Teknisi belum kontribusi: ${sortedUsersWithoutEstimasi.length}\n`,
+                                    `• Total teknisi terdaftar: ${teknisiUsers.length}\n`,
+                                    `• Persentase aktif: ${teknisiUsers.length > 0 ? ((usersWithEstimasi.length / teknisiUsers.length) * 100).toFixed(1) : 0}%\n`,
+                                ],
+                                fontSize: 8,
+                                color: '#FF3B30'
+                            }
+                        ],
+                        columnGap: 10,
+                        margin: [0, 20, 0, 10]
+                    }
+                ],
+
+                footer: function(currentPage, pageCount) {
+                    return {
+                        text: `Halaman ${currentPage} dari ${pageCount}`,
+                        alignment: 'center',
+                        fontSize: 8,
+                        color: '#8E8E93',
+                        margin: [0, 10, 0, 0]
+                    };
+                }
+            };
+
+            // Download PDF
+            pdfMake.createPdf(docDefinition).download(
+                `Laporan_Teknisi_CR7_${this.accState.dateStart}_${this.accState.dateEnd}.pdf`
+    );
+
+            this.showNotification('Laporan dengan 2 tabel berhasil didownload!', 'success');
+
+            console.log('\n=== FINAL SUMMARY ===');
+            console.log('Tabel 1 (Kontribusi):', sortedEstimasi.length, 'teknisi');
+            console.log('Tabel 2 (Belum Kontribusi):', sortedUsersWithoutEstimasi.length, 'teknisi');
+            console.log('  - Total teknisi terdaftar:', teknisiUsers.length);
+            console.log('  - Aktif:', usersWithEstimasi.length);
+            console.log('  - Tidak Aktif:', sortedUsersWithoutEstimasi.length);
+        }
+
+        // Helper function untuk ranking
+        getRankBadge(rank) {
+            let badgeStyle = {};
+
+            switch(rank) {
+                case 1:
+                    badgeStyle = {
+                        text: '🥇',
+                        alignment: 'center',
+                        fontSize: 10,
+                        bold: true
+                    };
+                    break;
+                case 2:
+                    badgeStyle = {
+                        text: '🥈',
+                        alignment: 'center',
+                        fontSize: 10
+                    };
+                    break;
+                case 3:
+                    badgeStyle = {
+                        text: '🥉',
+                        alignment: 'center',
+                        fontSize: 10
+                    };
+                    break;
+                default:
+                    badgeStyle = {
+                        text: rank.toString(),
+                        alignment: 'center',
+                        fontSize: 9,
+                        color: '#8E8E93'
+                    };
+            }
+
+            return badgeStyle;
+        }
+
+        // Helper function untuk ranking
+        getRankBadge(rank) {
+            let badgeStyle = {};
+
+            switch(rank) {
+                case 1:
+                    badgeStyle = {
+                        text: '🥇',
+                        alignment: 'center',
+                        fontSize: 10,
+                        bold: true
+                    };
+                    break;
+                case 2:
+                    badgeStyle = {
+                        text: '🥈',
+                        alignment: 'center',
+                        fontSize: 10
+                    };
+                    break;
+                case 3:
+                    badgeStyle = {
+                        text: '🥉',
+                        alignment: 'center',
+                        fontSize: 10
+                    };
+                    break;
+                default:
+                    badgeStyle = {
+                        text: rank.toString(),
+                        alignment: 'center',
+                        fontSize: 9,
+                        color: '#8E8E93'
+                    };
+            }
+
+            return badgeStyle;
+        }
+
+        // Helper function untuk membuat badge ranking
+        getRankBadge(rank) {
+            let badgeStyle = {};
+
+            switch(rank) {
+                case 1:
+                    badgeStyle = {
+                        text: '🥇',
+                        alignment: 'center',
+                        fontSize: 10,
+                        bold: true
+                    };
+                    break;
+                case 2:
+                    badgeStyle = {
+                        text: '🥈',
+                        alignment: 'center',
+                        fontSize: 10
+                    };
+                    break;
+                case 3:
+                    badgeStyle = {
+                        text: '🥉',
+                        alignment: 'center',
+                        fontSize: 10
+                    };
+                    break;
+                default:
+                    badgeStyle = {
+                        text: rank.toString(),
+                        alignment: 'center',
+                        fontSize: 9,
+                        color: '#8E8E93'
+                    };
+            }
+
+            return badgeStyle;
+        }
+
+
+        // Helper function untuk membuat badge ranking
+        getRankBadge(rank) {
+            let badgeStyle = {};
+
+            switch(rank) {
+                case 1:
+                    badgeStyle = {
+                        text: '1',
+                        alignment: 'center',
+                        fontSize: 10
+                    };
+                    break;
+                case 2:
+                    badgeStyle = {
+                        text: '2',
+                        alignment: 'center',
+                        fontSize: 10
+                    };
+                    break;
+                case 3:
+                    badgeStyle = {
+                        text: '3',
+                        alignment: 'center',
+                        fontSize: 10
+                    };
+                    break;
+                default:
+                    badgeStyle = {
+                        text: rank.toString(),
+                        alignment: 'center',
+                        fontSize: 9,
+                        color: '#8E8E93'
+                    };
+            }
+
+            return badgeStyle;
+        }
     }
 
     // Fungsi untuk convert URL ke base64
@@ -3685,681 +5973,669 @@ tunas TOYOTA Batu Tulis 🚗✨`;
         return { text: text };
     }
 
-async function generatePdfA5(format = 'A5') {
-    try {
-        if (!currentEstimasiId) {
-            alert('Tidak ada data estimasi yang dipilih');
-            return;
-        }
+    async function generatePdfA5(format = 'A5') {
+        try {
+            if (!currentEstimasiId) {
+                console.error('❌ Tidak ada currentEstimasiId');
+                alert('Tidak ada data estimasi yang dipilih');
+                return;
+            }
 
-        const { data, error } = await supabase
-        .from('estimasi')
-        .select('*')
-        .eq('id', currentEstimasiId)
-        .single();
-
-        if (error) throw error;
-
-        // Ambil data teknisi
-        let teknisiNama = '-';
-        if (data.teknisi_id) {
-            const { data: userData, error: userError } = await supabase
-            .from('users')
-            .select('full_name')
-            .eq('id', data.teknisi_id)
+            console.log('🔍 Mengambil data dari supabase...');
+            const { data, error } = await supabase
+            .from('estimasi')
+            .select('*')
+            .eq('id', currentEstimasiId)
             .single();
 
-            if (!userError && userData) {
-                teknisiNama = userData.full_name || '-';
+            if (error) {
+                console.error('❌ Error dari supabase:', error);
+                throw error;
             }
-        }
 
-        // Ambil data sparepart yang sudah di-ACC
-        const selectedSpareparts = parseKomponen(data.mra_selected_spareparts || []);
+            console.log('✅ Data berhasil diambil:', data);
+            console.log('🔍 Data foto_url:', data.foto_url);
 
-        // Ambil setting diskon dari dashboard (gunakan dari app instance)
-        const diskonSparepart = window.app?.diskonSettings?.sparepart || 0;
-        const diskonJasa = window.app?.diskonSettings?.jasa || 0;
+            // Ambil data teknisi
+            let teknisiNama = '-';
+            if (data.teknisi_id) {
+                const { data: userData, error: userError } = await supabase
+                .from('users')
+                .select('full_name')
+                .eq('id', data.teknisi_id)
+                .single();
 
-        // Ambil data diskon manual dari app instance
-        const manualSparepart = window.app?.diskonSettings?.manualSparepart || {};
-        const manualJasa = window.app?.diskonSettings?.manualJasa || {};
-
-        // Handle sparepart dengan perhitungan total yang benar
-        let sparepartData = [];
-        let totalHargaSparepartNormal = 0;
-        let totalHargaSparepartDiskon = 0;
-        let totalHargaSparepartNonAcc = 0;
-
-        if (data.sparepart_data) {
-            if (Array.isArray(data.sparepart_data)) {
-                sparepartData = data.sparepart_data;
-            } else if (typeof data.sparepart_data === 'string') {
-                try {
-                    sparepartData = JSON.parse(data.sparepart_data);
-                    if (!Array.isArray(sparepartData)) sparepartData = [];
-                } catch (e) {
-                    sparepartData = [];
+                if (!userError && userData) {
+                    teknisiNama = userData.full_name || '-';
                 }
             }
 
-            // Hitung total harga sparepart dengan diskon manual
-            if (sparepartData.length > 0) {
-                sparepartData.forEach((item, index) => {
-                    const itemTotal = parseFloat(item.total || item.subtotal || 0);
+            // Ambil data sparepart yang sudah di-ACC
+            const selectedSpareparts = parseKomponen(data.mra_selected_spareparts || []);
 
-                    // PERBAIKAN: GUNAKAN DISKON MANUAL JIKA ADA, JIKA TIDAK GUNAKAN DISKON OTOMATIS
-                    const diskonManualSparepart = manualSparepart[index];
-                    const diskonAktifSparepart = diskonManualSparepart !== undefined ?
-                        diskonManualSparepart : diskonSparepart;
+            // Ambil setting diskon dari dashboard (gunakan dari app instance)
+            const diskonSparepart = window.app?.diskonSettings?.sparepart || 0;
+            const diskonJasa = window.app?.diskonSettings?.jasa || 0;
 
-                    const hargaSetelahDiskon = itemTotal * (1 - diskonAktifSparepart / 100);
+            // Ambil data diskon manual dari app instance
+            const manualSparepart = window.app?.diskonSettings?.manualSparepart || {};
+            const manualJasa = window.app?.diskonSettings?.manualJasa || {};
 
-                    // PERBAIKAN: SAMAKAN FORMAT STRING UNTUK PERBANDINGAN
-                    const isAccCompleted = selectedSpareparts
+            // Handle sparepart dengan perhitungan total yang benar
+            let sparepartData = [];
+            let totalHargaSparepartNormal = 0;
+            let totalHargaSparepartDiskon = 0;
+            let totalHargaSparepartNonAcc = 0;
+
+            if (data.sparepart_data) {
+                if (Array.isArray(data.sparepart_data)) {
+                    sparepartData = data.sparepart_data;
+                } else if (typeof data.sparepart_data === 'string') {
+                    try {
+                        sparepartData = JSON.parse(data.sparepart_data);
+                        if (!Array.isArray(sparepartData)) sparepartData = [];
+                    } catch (e) {
+                        sparepartData = [];
+                    }
+                }
+
+                // Hitung total harga sparepart dengan diskon manual
+                if (sparepartData.length > 0) {
+                    sparepartData.forEach((item, index) => {
+                        const itemTotal = parseFloat(item.total || item.subtotal || 0);
+
+                        // PERBAIKAN: GUNAKAN DISKON MANUAL JIKA ADA, JIKA TIDAK GUNAKAN DISKON OTOMATIS
+                        const diskonManualSparepart = manualSparepart[index];
+                        const diskonAktifSparepart = diskonManualSparepart !== undefined ?
+                              diskonManualSparepart : diskonSparepart;
+
+                        const hargaSetelahDiskon = itemTotal * (1 - diskonAktifSparepart / 100);
+
+                        // PERBAIKAN: SAMAKAN FORMAT STRING UNTUK PERBANDINGAN
+                        const isAccCompleted = selectedSpareparts
                         .map(s => s.toLowerCase().trim())
                         .includes((item.name || "").toLowerCase().trim());
 
-                    if (!isAccCompleted) {
-                        totalHargaSparepartNormal += itemTotal;
-                        totalHargaSparepartDiskon += hargaSetelahDiskon;
-                    }
-                });
-
-                totalHargaSparepartNonAcc = Math.round(totalHargaSparepartDiskon);
-            }
-        }
-
-        // Handle service data dengan diskon manual
-        let serviceData = [];
-        let totalHargaServiceNormal = 0;
-        let totalHargaServiceDiskon = 0;
-
-        if (data.service_data) {
-            if (Array.isArray(data.service_data)) {
-                serviceData = data.service_data;
-            } else if (typeof data.service_data === 'string') {
-                try {
-                    serviceData = JSON.parse(data.service_data);
-                    if (!Array.isArray(serviceData)) serviceData = [];
-                } catch (e) {
-                    serviceData = [];
-                }
-            }
-
-            // Hitung total harga service dengan diskon manual
-            if (serviceData.length > 0) {
-                serviceData.forEach((service, index) => {
-                    const serviceTotal = parseFloat(service.total || service.subtotal || 0);
-
-                    // PERBAIKAN: GUNAKAN DISKON MANUAL JIKA ADA, JIKA TIDAK GUNAKAN DISKON OTOMATIS
-                    const diskonManualJasa = manualJasa[index];
-                    const diskonAktifJasa = diskonManualJasa !== undefined ?
-                        diskonManualJasa : diskonJasa;
-
-                    const hargaSetelahDiskon = serviceTotal * (1 - diskonAktifJasa / 100);
-
-                    totalHargaServiceNormal += serviceTotal;
-                    totalHargaServiceDiskon += hargaSetelahDiskon;
-                });
-            }
-        }
-
-        // Hitung total harga keseluruhan setelah diskon
-        const totalHargaKeseluruhan = Math.round(totalHargaSparepartDiskon + totalHargaServiceDiskon);
-        const totalDiskonSparepart = totalHargaSparepartNormal - totalHargaSparepartDiskon;
-        const totalDiskonJasa = totalHargaServiceNormal - totalHargaServiceDiskon;
-        const totalDiskonKeseluruhan = totalDiskonSparepart + totalDiskonJasa;
-
-        // Handle foto URL
-        let fotoArray = [];
-        let fotoImages = [];
-        if (data.foto_url) {
-            try {
-                if (typeof data.foto_url === 'string') {
-                    try {
-                        const parsed = JSON.parse(data.foto_url);
-                        fotoArray = Array.isArray(parsed) ? parsed : [];
-                    } catch (e) {
-                        if (data.foto_url.includes('[') && data.foto_url.includes(']')) {
-                            const cleanString = data.foto_url.replace(/\\/g, '').replace(/"/g, '"');
-                            try {
-                                const reparsed = JSON.parse(cleanString);
-                                fotoArray = Array.isArray(reparsed) ? reparsed : [data.foto_url];
-                            } catch (e2) {
-                                fotoArray = [data.foto_url];
-                            }
-                        } else {
-                            fotoArray = [data.foto_url];
+                        if (!isAccCompleted) {
+                            totalHargaSparepartNormal += itemTotal;
+                            totalHargaSparepartDiskon += hargaSetelahDiskon;
                         }
+                    });
+
+                    totalHargaSparepartNonAcc = Math.round(totalHargaSparepartDiskon);
+                }
+            }
+
+            // Handle service data dengan diskon manual
+            let serviceData = [];
+            let totalHargaServiceNormal = 0;
+            let totalHargaServiceDiskon = 0;
+
+            if (data.service_data) {
+                if (Array.isArray(data.service_data)) {
+                    serviceData = data.service_data;
+                } else if (typeof data.service_data === 'string') {
+                    try {
+                        serviceData = JSON.parse(data.service_data);
+                        if (!Array.isArray(serviceData)) serviceData = [];
+                    } catch (e) {
+                        serviceData = [];
                     }
-                } else if (Array.isArray(data.foto_url)) {
-                    fotoArray = data.foto_url;
                 }
 
-                // Convert foto URLs ke base64 untuk PDF
-                if (fotoArray.length > 0) {
-                    for (const fotoUrl of fotoArray) {
-                        try {
-                            if (fotoUrl && typeof fotoUrl === 'string' && fotoUrl.startsWith('http')) {
+                // Hitung total harga service dengan diskon manual
+                if (serviceData.length > 0) {
+                    serviceData.forEach((service, index) => {
+                        const serviceTotal = parseFloat(service.total || service.subtotal || 0);
+
+                        // PERBAIKAN: GUNAKAN DISKON MANUAL JIKA ADA, JIKA TIDAK GUNAKAN DISKON OTOMATIS
+                        const diskonManualJasa = manualJasa[index];
+                        const diskonAktifJasa = diskonManualJasa !== undefined ?
+                              diskonManualJasa : diskonJasa;
+
+                        const hargaSetelahDiskon = serviceTotal * (1 - diskonAktifJasa / 100);
+
+                        totalHargaServiceNormal += serviceTotal;
+                        totalHargaServiceDiskon += hargaSetelahDiskon;
+                    });
+                }
+            }
+
+            // Hitung total harga keseluruhan setelah diskon
+            const totalHargaKeseluruhan = Math.round(totalHargaSparepartDiskon + totalHargaServiceDiskon);
+            const totalDiskonSparepart = totalHargaSparepartNormal - totalHargaSparepartDiskon;
+            const totalDiskonJasa = totalHargaServiceNormal - totalHargaServiceDiskon;
+            const totalDiskonKeseluruhan = totalDiskonSparepart + totalDiskonJasa;
+
+            // Handle foto URL
+            let fotoArray = [];
+            let fotoImages = [];
+            if (data.foto_url) {
+                try {
+                    fotoArray = typeof data.foto_url === 'string'
+                        ? JSON.parse(data.foto_url)
+                    : data.foto_url;
+
+                    if (!Array.isArray(fotoArray)) {
+                        fotoArray = [];
+                    }
+
+                    // Convert foto URLs ke base64 untuk PDF
+                    if (fotoArray.length > 0) {
+                        for (const fotoUrl of fotoArray) {
+                            try {
                                 const base64Image = await getBase64FromUrl(fotoUrl);
                                 fotoImages.push(base64Image);
+                            } catch (error) {
+                                console.error('Error converting image to base64:', error);
                             }
-                        } catch (error) {
-                            console.error('Error converting image to base64:', error, 'URL:', fotoUrl);
                         }
                     }
+                } catch (e) {
+                    console.error('Error parsing foto_url:', e);
+                    fotoArray = [];
                 }
-            } catch (e) {
-                console.error('Error parsing foto_url:', e);
-                fotoArray = [];
-            }
-        }
-
-        // Dapatkan nomor WhatsApp berdasarkan Service Advisor
-        const serviceAdvisor = data.service_advisor || 'Abdul Azis';
-        const whatsappNumber = getWhatsAppNumber(serviceAdvisor);
-
-        // QR admin dan icons
-        const qrBase64 = await getBase64FromUrl(
-            "https://pjawwektzazcxakgopou.supabase.co/storage/v1/object/public/static/qrcode.png"
-        );
-
-        const whatsappIcon = await getBase64FromUrl(
-            "https://pjawwektzazcxakgopou.supabase.co/storage/v1/object/public/static/whatsapp.png"
-        );
-
-        const tunasLogo = await getBase64FromUrl(
-            "https://pjawwektzazcxakgopou.supabase.co/storage/v1/object/public/static/tunas.png"
-        );
-
-        // Siapkan content PDF
-        const content = [
-            { text: 'Estimasi Saran Perbaikan', alignment: 'center', fontSize: 12, margin: [0, 0, 0, 12] },
-
-            { text: `Nomor Polisi: ${data.nopol}`, fontSize: 10, margin: [0, 0, 0, 3] },
-            { text: `Nomor Rangka: ${data.nomor_rangka || '-'}`, fontSize: 10, margin: [0, 0, 0, 3] },
-            { text: `Nama Teknisi: ${teknisiNama}`, fontSize: 10, margin: [0, 0, 0, 3] },
-            { text: `Tanggal Estimasi: ${new Date(data.created_at).toLocaleDateString('id-ID')}`, fontSize: 10, margin: [0, 0, 0, 12] }
-        ];
-
-        // TAMPILKAN INFORMASI DISKON YANG SEDANG AKTIF (OTOMATIS ATAU MANUAL)
-        const manualSparepartCount = Object.keys(manualSparepart).length;
-        const manualJasaCount = Object.keys(manualJasa).length;
-
-        if (diskonSparepart > 0 || diskonJasa > 0 || manualSparepartCount > 0 || manualJasaCount > 0) {
-            content.push({
-                text: 'INFORMASI DISKON:',
-                fontSize: 9,
-                bold: true,
-                margin: [0, 0, 0, 5],
-                color: '#e60000'
-            });
-
-            // Tampilkan informasi diskon sparepart
-            if (diskonSparepart > 0 || manualSparepartCount > 0) {
-                let sparepartText = `Diskon Sparepart: ${diskonSparepart}%`;
-
-                // Tambahkan info diskon manual jika ada
-                if (manualSparepartCount > 0) {
-                    const manualItems = Object.entries(manualSparepart)
-                        .map(([index, diskon]) => {
-                            const sparepartIndex = parseInt(index);
-                            const sparepartName = sparepartData[sparepartIndex]?.name || `Item ${parseInt(index) + 1}`;
-                            return `${sparepartName} diskon ${diskon}%`;
-                        })
-                        .join(', ');
-
-                    sparepartText += ` (khusus ${manualItems})`;
-                }
-
-                content.push({
-                    text: sparepartText,
-                    fontSize: 8,
-                    margin: [0, 0, 0, 2]
-                });
             }
 
-            // Tampilkan informasi diskon jasa
-            if (diskonJasa > 0 || manualJasaCount > 0) {
-                let jasaText = `Diskon Jasa: ${diskonJasa}%`;
+            // Dapatkan nomor WhatsApp berdasarkan Service Advisor
+            const serviceAdvisor = data.service_advisor || 'Abdul Azis';
+            const whatsappNumber = getWhatsAppNumber(serviceAdvisor);
 
-                // Tambahkan info diskon manual jika ada
-                if (manualJasaCount > 0) {
-                    const manualItems = Object.entries(manualJasa)
-                        .map(([index, diskon]) => {
-                            const serviceIndex = parseInt(index);
-                            const serviceName = serviceData[serviceIndex]?.name || serviceData[serviceIndex]?.desc || `Jasa ${parseInt(index) + 1}`;
-                            return `${serviceName} diskon ${diskon}%`;
-                        })
-                        .join(', ');
+            // QR admin dan icons
+            const qrBase64 = await getBase64FromUrl(
+                "https://pjawwektzazcxakgopou.supabase.co/storage/v1/object/public/static/qrcode.png"
+            );
 
-                    jasaText += ` (khusus ${manualItems})`;
-                }
+            const whatsappIcon = await getBase64FromUrl(
+                "https://pjawwektzazcxakgopou.supabase.co/storage/v1/object/public/static/whatsapp.png"
+            );
 
-                content.push({
-                    text: jasaText,
-                    fontSize: 8,
-                    margin: [0, 0, 0, 2]
-                });
-            }
+            const tunasLogo = await getBase64FromUrl(
+                "https://pjawwektzazcxakgopou.supabase.co/storage/v1/object/public/static/tunas.png"
+            );
 
-            content.push({ text: '', margin: [0, 0, 0, 8] });
-        }
+            // Siapkan content PDF
+            const content = [
+                { text: 'Estimasi Saran Perbaikan', alignment: 'center', fontSize: 12, margin: [0, 0, 0, 12] },
 
-        // INFORMASI KOMPONEN YANG SUDAH DI-ACC
-        if (selectedSpareparts.length > 0) {
-            content.push({
-                text: 'KOMPONEN YANG SUDAH DISETUJUI:',
-                fontSize: 9,
-                bold: true,
-                margin: [0, 0, 0, 5],
-                color: '#e60000'
-            });
-
-            content.push({
-                text: selectedSpareparts.join(', '),
-                fontSize: 8,
-                margin: [0, 0, 0, 10]
-            });
-        }
-
-        // Tambahkan tabel sparepart jika ada data
-        if (sparepartData.length > 0) {
-            const sparepartBody = [
-                [
-                    { text: 'Nama Barang', fillColor: '#2196F3', color: 'white', bold: true },
-                    { text: 'Harga', fillColor: '#2196F3', color: 'white', bold: true },
-                    { text: 'Jml', fillColor: '#2196F3', color: 'white', bold: true },
-                    { text: 'Total', fillColor: '#2196F3', color: 'white', bold: true },
-                    { text: 'Part', fillColor: '#2196F3', color: 'white', bold: true }
-                ]
+                { text: `Nomor Polisi: ${data.nopol}`, fontSize: 10, margin: [0, 0, 0, 3] },
+                { text: `Nomor Rangka: ${data.nomor_rangka || '-'}`, fontSize: 10, margin: [0, 0, 0, 3] },
+                { text: `Nama Teknisi: ${teknisiNama}`, fontSize: 10, margin: [0, 0, 0, 3] },
+                { text: `Tanggal Estimasi: ${new Date(data.created_at).toLocaleDateString('id-ID')}`, fontSize: 10, margin: [0, 0, 0, 12] }
             ];
 
-            // Tambahkan baris data sparepart DENGAN FUNGSI CELL HELPER
-            sparepartData.forEach((item, index) => {
-                let avail = '-';
-                if (item.availability) {
-                    const val = item.availability.toLowerCase();
-                    if (val === 'ada') avail = 'Ada';
-                    else if (val === 'kosong') avail = 'Kosong';
-                    else if (val === 'bo') avail = 'BO';
-                    else if (val === 'tam') avail = 'TAM';
-                }
+            // INFORMASI KOMPONEN YANG SUDAH DI-ACC
+            if (selectedSpareparts.length > 0) {
+                content.push({
+                    text: 'KOMPONEN YANG SUDAH DISETUJUI:',
+                    fontSize: 9,
+                    bold: true,
+                    margin: [0, 0, 0, 5],
+                    color: '#e60000'
+                });
 
-                // PERBAIKAN: SAMAKAN FORMAT STRING UNTUK PERBANDINGAN
-                const isAccCompleted = selectedSpareparts
+                content.push({
+                    text: selectedSpareparts.join(', '),
+                    fontSize: 8,
+                    margin: [0, 0, 0, 10]
+                });
+            }
+
+            // Helper function untuk cell dengan styling ACC - PERBAIKAN: Hapus 'none' decoration
+            function createCell(text, isAccCompleted = false) {
+                if (isAccCompleted) {
+                    return {
+                        text: text,
+                        decoration: 'lineThrough',
+                        color: '#e60000'
+                    };
+                } else {
+                    return { text: text };
+                }
+            }
+
+            // Tambahkan tabel sparepart jika ada data
+            if (sparepartData.length > 0) {
+                // Tentukan apakah ada diskon untuk menentukan struktur kolom
+                const manualSparepartCount = Object.keys(manualSparepart).length;
+                const adaDiskon = diskonSparepart > 0 || manualSparepartCount > 0;
+
+                const sparepartHeader = adaDiskon ?
+                      [
+                          { text: 'Nama Barang', fillColor: '#2196F3', color: 'white', bold: true },
+                          { text: 'Harga Normal', fillColor: '#2196F3', color: 'white', bold: true },
+                          { text: 'Disc', fillColor: '#2196F3', color: 'white', bold: true },
+                          { text: 'Harga Setelah Disc', fillColor: '#2196F3', color: 'white', bold: true },
+                          { text: 'Part', fillColor: '#2196F3', color: 'white', bold: true }
+                      ] : [
+                          { text: 'Nama Barang', fillColor: '#2196F3', color: 'white', bold: true },
+                          { text: 'Harga', fillColor: '#2196F3', color: 'white', bold: true },
+                          { text: 'Jml', fillColor: '#2196F3', color: 'white', bold: true },
+                          { text: 'Total', fillColor: '#2196F3', color: 'white', bold: true },
+                          { text: 'Part', fillColor: '#2196F3', color: 'white', bold: true }
+                      ];
+
+                const sparepartBody = [sparepartHeader];
+
+                // Tambahkan baris data sparepart
+                sparepartData.forEach((item, index) => {
+                    let avail = '-';
+                    if (item.availability) {
+                        const val = item.availability.toLowerCase();
+                        if (val === 'ada') avail = 'Ada';
+                        else if (val === 'kosong') avail = 'N/A';
+                        else if (val === 'bo') avail = 'BO';
+                        else if (val === 'tam') avail = 'TAM';
+                    }
+
+                    // Potong hanya 3 karakter untuk kolom part
+                    avail = avail.substring(0, 3);
+
+                    const isAccCompleted = selectedSpareparts
                     .map(s => s.toLowerCase().trim())
                     .includes((item.name || "").toLowerCase().trim());
 
-                // Hitung harga dengan diskon yang aktif
-                const itemTotal = parseFloat(item.total || item.subtotal || 0);
-                const diskonManualSparepart = manualSparepart[index];
-                const diskonAktifSparepart = diskonManualSparepart !== undefined ?
-                    diskonManualSparepart : diskonSparepart;
-                const hargaSetelahDiskon = itemTotal * (1 - diskonAktifSparepart / 100);
+                    // Hitung harga dengan diskon yang aktif
+                    const itemTotal = parseFloat(item.total || item.subtotal || 0);
+                    const diskonManualSparepart = manualSparepart[index];
+                    const diskonAktifSparepart = diskonManualSparepart !== undefined ?
+                          diskonManualSparepart : diskonSparepart;
+                    const hargaSetelahDiskon = itemTotal * (1 - diskonAktifSparepart / 100);
 
-                // GUNAKAN FUNGSI CELL HELPER UNTUK SETIAP CELL
-                sparepartBody.push([
-                    cell(truncateText(item.name, 25) || '-', isAccCompleted),
-                    cell(formatRupiah(item.price || 0), isAccCompleted),
-                    cell(item.qty || 1, isAccCompleted),
-                    cell(formatRupiah(Math.round(hargaSetelahDiskon)), isAccCompleted),
-                    cell(avail, isAccCompleted)
-                ]);
-            });
+                    if (adaDiskon) {
+                        // Format dengan diskon
+                        const namaBarangText = `${truncateText(item.name, 25) || '-'} (x${item.qty || 1})`;
 
-            // Baris total sparepart - PERBAIKAN: TAMPILKAN BERBEDA JIKA ADA DISKON ATAU TIDAK
-            if (diskonSparepart > 0 || manualSparepartCount > 0) {
-                // Jika ada diskon, tampilkan normal dan setelah diskon
-                sparepartBody.push([
-                    { text: 'Total Harga Sparepart (Normal)', colSpan: 3, alignment: 'right', bold: true }, {}, {},
-                    { text: formatRupiah(totalHargaSparepartNormal), bold: true },
-                    ''
-                ]);
+                        // PERBAIKAN: Harga normal HARUS dicoret jika ada diskon, terlepas dari status ACC
+                        const hargaNormalStyle = diskonAktifSparepart > 0 ? {
+                            text: formatRupiah(itemTotal),
+                            decoration: 'lineThrough', // SELALU coret jika ada diskon
+                            color: '#666666'
+                        } : {
+                            text: formatRupiah(itemTotal),
+                            color: isAccCompleted ? '#e60000' : 'black'
+                        };
 
-                sparepartBody.push([
-                    {
-                        text: manualSparepartCount > 0 ?
-                            `Diskon Sparepart (${manualSparepartCount} item)` :
-                            `Diskon Sparepart (${diskonSparepart}%)`,
-                        colSpan: 3,
-                        alignment: 'right',
-                        color: '#e60000'
-                    }, {}, {},
-                    { text: `- ${formatRupiah(totalDiskonSparepart)}`, color: '#e60000' },
-                    ''
-                ]);
-
-                // Baris total sparepart setelah diskon
-                sparepartBody.push([
-                    { text: 'Total Harga Sparepart (Setelah Diskon)', colSpan: 3, alignment: 'right', bold: true, color: '#2e7d32' }, {}, {},
-                    { text: formatRupiah(totalHargaSparepartDiskon), bold: true, color: '#2e7d32' },
-                    ''
-                ]);
-            } else {
-                // Jika tidak ada diskon, tampilkan hanya "Total Harga Sparepart" saja
-                sparepartBody.push([
-                    { text: 'Total Harga Sparepart', colSpan: 3, alignment: 'right', bold: true }, {}, {},
-                    { text: formatRupiah(totalHargaSparepartNormal), bold: true },
-                    ''
-                ]);
-            }
-
-            content.push({
-                table: {
-                    widths: ['*', 'auto', 'auto', 'auto', 'auto'],
-                    body: sparepartBody
-                },
-                fontSize: 9,
-                margin: [0, 0, 0, 12]
-            });
-        }
-
-        // Tambahkan tabel service jika ada data
-        if (serviceData.length > 0) {
-            const serviceBody = [
-                [
-                    { text: 'Jenis Service', fillColor: '#2196F3', color: 'white', bold: true },
-                    { text: 'Jam', fillColor: '#2196F3', color: 'white', bold: true },
-                    { text: 'Harga/Jam', fillColor: '#2196F3', color: 'white', bold: true },
-                    { text: 'Total', fillColor: '#2196F3', color: 'white', bold: true }
-                ]
-            ];
-
-            serviceBody.push(...serviceData.map((service, index) => {
-                // Hitung harga dengan diskon yang aktif
-                const serviceTotal = parseFloat(service.total || service.subtotal || 0);
-                const diskonManualJasa = manualJasa[index];
-                const diskonAktifJasa = diskonManualJasa !== undefined ?
-                    diskonManualJasa : diskonJasa;
-                const hargaSetelahDiskon = serviceTotal * (1 - diskonAktifJasa / 100);
-
-                return [
-                    { text: truncateText(service.desc || '-', 30) },
-                    { text: service.hour || service.jam || 0 },
-                    { text: formatRupiah(service.price || service.harga || 0) },
-                    { text: formatRupiah(Math.round(hargaSetelahDiskon)) }
-                ];
-            }));
-
-            // Baris total service - PERBAIKAN: TAMPILKAN BERBEDA JIKA ADA DISKON ATAU TIDAK
-            if (diskonJasa > 0 || manualJasaCount > 0) {
-                // Jika ada diskon, tampilkan normal dan setelah diskon
-                serviceBody.push([
-                    { text: 'Total Harga Service (Normal)', colSpan: 3, alignment: 'right', bold: true }, {}, {},
-                    { text: formatRupiah(totalHargaServiceNormal), bold: true }
-                ]);
-
-                serviceBody.push([
-                    {
-                        text: manualJasaCount > 0 ?
-                            `Diskon Jasa (${manualJasaCount} item)` :
-                            `Diskon Jasa (${diskonJasa}%)`,
-                        colSpan: 3,
-                        alignment: 'right',
-                        color: '#e60000'
-                    }, {}, {},
-                    { text: `- ${formatRupiah(totalDiskonJasa)}`, color: '#e60000' }
-                ]);
-
-                // Baris total service setelah diskon
-                serviceBody.push([
-                    { text: 'Total Harga Service (Setelah Diskon)', colSpan: 3, alignment: 'right', bold: true, color: '#2e7d32' }, {}, {},
-                    { text: formatRupiah(totalHargaServiceDiskon), bold: true, color: '#2e7d32' }
-                ]);
-            } else {
-                // Jika tidak ada diskon, tampilkan hanya "Total Harga Service" saja
-                serviceBody.push([
-                    { text: 'Total Harga Service', colSpan: 3, alignment: 'right', bold: true }, {}, {},
-                    { text: formatRupiah(totalHargaServiceNormal), bold: true }
-                ]);
-            }
-
-            content.push({
-                table: {
-                    widths: ['*', 'auto', 'auto', 'auto'],
-                    body: serviceBody
-                },
-                fontSize: 9,
-                margin: [0, 0, 0, 12]
-            });
-        }
-
-        // Tambahkan RINGKASAN FINAL - PERBAIKAN: TAMPILKAN BERBEDA JIKA ADA DISKON ATAU TIDAK
-        const ringkasanBody = [];
-
-        if (totalDiskonKeseluruhan > 0) {
-            // Jika ada diskon, tampilkan normal, diskon, dan setelah diskon
-            ringkasanBody.push([
-                { text: 'Total Harga Normal', alignment: 'right', bold: true },
-                { text: formatRupiah(totalHargaSparepartNormal + totalHargaServiceNormal), bold: true }
-            ]);
-
-            ringkasanBody.push([
-                { text: 'Total Diskon', alignment: 'right', color: '#e60000' },
-                { text: `- ${formatRupiah(totalDiskonKeseluruhan)}`, color: '#e60000' }
-            ]);
-
-            ringkasanBody.push([
-                { text: 'TOTAL HARGA SETELAH DISKON', alignment: 'right', bold: true, fontSize: 11 },
-                { text: formatRupiah(totalHargaKeseluruhan), bold: true, fontSize: 11, color: '#4caf50' }
-            ]);
-        } else {
-            // Jika tidak ada diskon, tampilkan hanya "TOTAL HARGA" saja
-            ringkasanBody.push([
-                { text: 'TOTAL HARGA', alignment: 'right', bold: true, fontSize: 11 },
-                { text: formatRupiah(totalHargaKeseluruhan), bold: true, fontSize: 11, color: '#4caf50' }
-            ]);
-        }
-
-        content.push({
-            table: {
-                widths: ['*', 'auto'],
-                body: ringkasanBody
-            },
-            margin: [0, 0, 0, 12]
-        });
-
-        // Tambahkan gambar jika ada
-        if (fotoImages.length > 0) {
-            content.push({
-                text: 'Foto Estimasi:',
-                fontSize: 10,
-                bold: true,
-                margin: [0, 10, 0, 5]
-            });
-
-            const fotoPerBaris = 3;
-            const rows = [];
-
-            for (let i = 0; i < fotoImages.length; i += fotoPerBaris) {
-                const rowImages = fotoImages.slice(i, i + fotoPerBaris);
-                const columns = rowImages.map(img => ({
-                    image: img,
-                    fit: [180, 145],
-                    alignment: 'center',
-                    margin: [2, 0, 2, 0]
-                }));
-
-                while (columns.length < fotoPerBaris) {
-                    columns.push({ text: '', width: '*' });
+                        sparepartBody.push([
+                            createCell(namaBarangText, isAccCompleted),
+                            hargaNormalStyle,
+                            {
+                                text: diskonAktifSparepart > 0 ? `-${diskonAktifSparepart}%` : '-',
+                                color: diskonAktifSparepart > 0 ? '#e60000' : 'black'
+                            },
+                            {
+                                text: formatRupiah(Math.round(hargaSetelahDiskon)),
+                                color: isAccCompleted ? '#e60000' : '#2e7d32',
+                                bold: diskonAktifSparepart > 0
+                            },
+                            createCell(avail, isAccCompleted)
+                        ]);
+                    } else {
+                        // Format tanpa diskon (seperti sebelumnya)
+                        sparepartBody.push([
+                            createCell(truncateText(item.name, 25) || '-', isAccCompleted),
+                            createCell(formatRupiah(item.price || 0), isAccCompleted),
+                            createCell(item.qty || 1, isAccCompleted),
+                            createCell(formatRupiah(itemTotal), isAccCompleted),
+                            createCell(avail, isAccCompleted)
+                        ]);
+                    }
+                });
+                // Baris total sparepart - PERBAIKAN: SELARASKAN DENGAN KOLOM TOTAL
+                if (adaDiskon) {
+                    // Jika ada diskon, tampilkan total setelah diskon - lurus dengan kolom "Harga Setelah Disc"
+                    sparepartBody.push([
+                        { text: 'Total Harga Sparepart', colSpan: 3, alignment: 'right', bold: true }, {}, {},
+                        { text: formatRupiah(totalHargaSparepartDiskon), bold: true, color: '#2e7d32' },
+                        '' // Kolom part kosong untuk baris total
+                    ]);
+                } else {
+                    // Jika tidak ada diskon, tampilkan total normal - lurus dengan kolom "Total"
+                    sparepartBody.push([
+                        { text: 'Total Harga Sparepart', colSpan: 3, alignment: 'right', bold: true }, {}, {},
+                        { text: formatRupiah(totalHargaSparepartNormal), bold: true },
+                        '' // Kolom part kosong untuk baris total
+                    ]);
                 }
 
-                rows.push({
-                    columns: columns,
-                    columnGap: 6,
-                    margin: [0, 0, 0, 6]
+                // PERBAIKAN: ATUR LEBAR KOLOM YANG LEBIH PROPORSIONAL
+                const tableWidths = adaDiskon ?
+                      ['*', 'auto', 'auto', 'auto', 25] : // Kolom part hanya 25pt
+                ['*', 'auto', 'auto', 'auto', 25];  // Kolom part hanya 25pt
+
+                content.push({
+                    table: {
+                        widths: tableWidths,
+                        body: sparepartBody
+                    },
+                    fontSize: 9,
+                    margin: [0, 0, 0, 12]
+                });
+
+
+                // TAMBAHKAN NOTES JIKA ADA DISKON
+                if (adaDiskon) {
+                    const notes_harga = [
+                        { text: '*Harga normal yang tertulis sudah di kalikan dengan jumlah part', fontSize: 8, italics: true, margin: [0, 0, 0, 2] }
+                    ];
+                    content.push(...notes_harga);
+                    content.push({ text: '', margin: [0, 0, 0, 8] }); // Tambahkan spasi setelah notes
+                }
+            }
+
+            // Tambahkan tabel service jika ada data
+            if (serviceData.length > 0) {
+                const manualJasaCount = Object.keys(manualJasa).length;
+                const adaDiskonJasa = diskonJasa > 0 || manualJasaCount > 0;
+
+                const serviceHeader = adaDiskonJasa ?
+                      [
+                          { text: 'Jenis Service', fillColor: '#2196F3', color: 'white', bold: true },
+                          { text: 'Harga Normal', fillColor: '#2196F3', color: 'white', bold: true },
+                          { text: 'Disc', fillColor: '#2196F3', color: 'white', bold: true },
+                          { text: 'Harga Setelah Disc', fillColor: '#2196F3', color: 'white', bold: true }
+                      ] : [
+                          { text: 'Jenis Service', fillColor: '#2196F3', color: 'white', bold: true },
+                          { text: 'Jam', fillColor: '#2196F3', color: 'white', bold: true },
+                          { text: 'Harga/Jam', fillColor: '#2196F3', color: 'white', bold: true },
+                          { text: 'Total', fillColor: '#2196F3', color: 'white', bold: true }
+                      ];
+
+                const serviceBody = [serviceHeader];
+
+                serviceData.forEach((service, index) => {
+                    // Hitung harga dengan diskon yang aktif
+                    const serviceTotal = parseFloat(service.total || service.subtotal || 0);
+                    const diskonManualJasa = manualJasa[index];
+                    const diskonAktifJasa = diskonManualJasa !== undefined ?
+                          diskonManualJasa : diskonJasa;
+                    const hargaSetelahDiskon = serviceTotal * (1 - diskonAktifJasa / 100);
+
+                    if (adaDiskonJasa) {
+                        // Format dengan diskon untuk jasa
+                        serviceBody.push([
+                            { text: truncateText(service.desc || '-', 30) },
+                            {
+                                text: formatRupiah(serviceTotal),
+                                decoration: 'lineThrough',
+                                color: '#666666'
+                            },
+                            {
+                                text: diskonAktifJasa > 0 ? `-${diskonAktifJasa}%` : '-',
+                                color: diskonAktifJasa > 0 ? '#e60000' : 'black'
+                            },
+                            {
+                                text: formatRupiah(Math.round(hargaSetelahDiskon)),
+                                color: '#2e7d32',
+                                bold: diskonAktifJasa > 0
+                            }
+                        ]);
+                    } else {
+                        // Format tanpa diskon untuk jasa
+                        serviceBody.push([
+                            { text: truncateText(service.desc || '-', 30) },
+                            { text: service.hour || service.jam || 0 },
+                            { text: formatRupiah(service.price || service.harga || 0) },
+                            { text: formatRupiah(serviceTotal) }
+                        ]);
+                    }
+                });
+
+                // Baris total service
+                if (adaDiskonJasa) {
+                    serviceBody.push([
+                        { text: 'Total Harga Service', colSpan: 3, alignment: 'right', bold: true }, {}, {},
+                        { text: formatRupiah(totalHargaServiceDiskon), bold: true, color: '#2e7d32' }
+                    ]);
+                } else {
+                    serviceBody.push([
+                        { text: 'Total Harga Service', colSpan: 3, alignment: 'right', bold: true }, {}, {},
+                        { text: formatRupiah(totalHargaServiceNormal), bold: true }
+                    ]);
+                }
+
+                const serviceWidths = adaDiskonJasa ?
+                      ['*', 'auto', 'auto', 'auto'] :
+                ['*', 'auto', 'auto', 'auto'];
+
+                content.push({
+                    table: {
+                        widths: serviceWidths,
+                        body: serviceBody
+                    },
+                    fontSize: 9,
+                    margin: [0, 0, 0, 12]
                 });
             }
 
-            content.push(...rows);
-            content.push({ text: '', margin: [0, 0, 0, 10] });
-        }
+            // Tambahkan RINGKASAN FINAL
+            const ringkasanBody = [];
 
-        // Tambahkan keterangan dan footer notes
-        const notes = [
-            { text: '*Harga dapat berubah sewaktu-waktu tanpa pemberitahuan', fontSize: 8, italics: true, margin: [0, 0, 0, 2] },
-            { text: '*Ada (Dapat dilakukan penggantian), TAM (Order 3 hari), BO (Order 1 bulan), Kosong (berhenti produksi)', fontSize: 8, italics: true, margin: [0, 0, 0, 2] }
-        ];
+            if (totalDiskonKeseluruhan > 0) {
+                // Jika ada diskon, tampilkan normal, diskon, dan setelah diskon
+                ringkasanBody.push([
+                    { text: 'Total Harga Normal', alignment: 'right', bold: true },
+                    { text: formatRupiah(totalHargaSparepartNormal + totalHargaServiceNormal), bold: true }
+                ]);
 
-        // Tambahan informasi tentang perhitungan harga
-        if (selectedSpareparts.length > 0) {
-            notes.push(
-                {
-                    text: '*Item bergaris coret adalah komponen yang sudah disetujui dan tidak termasuk dalam total harga',
-                    fontSize: 8,
-                    italics: true,
-                    margin: [0, 0, 0, 2],
-                    color: '#e60000'
-                }
-            );
-        }
+                ringkasanBody.push([
+                    { text: 'Total Diskon', alignment: 'right', color: '#e60000' },
+                    { text: `- ${formatRupiah(totalDiskonKeseluruhan)}`, color: '#e60000' }
+                ]);
 
-        // PERBAIKAN: Tampilkan info diskon yang lebih detail
-        let diskonInfo = '';
-        if (manualSparepartCount > 0 || manualJasaCount > 0) {
-            diskonInfo = `*Perhitungan sudah termasuk diskon manual (${manualSparepartCount} sparepart, ${manualJasaCount} jasa)`;
-        } else if (diskonSparepart > 0 || diskonJasa > 0) {
-            diskonInfo = `*Perhitungan sudah termasuk diskon sparepart ${diskonSparepart}% dan diskon jasa ${diskonJasa}%`;
-        }
+                ringkasanBody.push([
+                    { text: 'TOTAL HARGA SETELAH DISKON', alignment: 'right', bold: true, fontSize: 11 },
+                    { text: formatRupiah(totalHargaKeseluruhan), bold: true, fontSize: 11, color: '#4caf50' }
+                ]);
+            } else {
+                // Jika tidak ada diskon, tampilkan hanya "TOTAL HARGA" saja
+                ringkasanBody.push([
+                    { text: 'TOTAL HARGA', alignment: 'right', bold: true, fontSize: 11 },
+                    { text: formatRupiah(totalHargaKeseluruhan), bold: true, fontSize: 11, color: '#4caf50' }
+                ]);
+            }
 
-        if (diskonInfo) {
-            notes.push({
-                text: diskonInfo,
-                fontSize: 8,
-                italics: true,
-                margin: [0, 8, 0, 0],
-                color: '#4caf50'
+            content.push({
+                table: {
+                    widths: ['*', 'auto'],
+                    body: ringkasanBody
+                },
+                margin: [0, 0, 0, 12]
             });
-        }
 
-        notes.push({
-            text: `Keterangan: ${data.keterangan || 'Tidak ada keterangan tambahan'}`,
-            fontSize: 10,
-            margin: [0, 8, 0, 0]
-        });
+            // Tambahkan gambar jika ada
+            if (fotoImages.length > 0) {
+                content.push({
+                    text: 'Foto Estimasi:',
+                    fontSize: 10,
+                    bold: true,
+                    margin: [0, 10, 0, 5]
+                });
 
-        content.push(...notes);
+                // Grid 3 kolom responsif dengan margin minimal
+                const fotoPerBaris = 3;
+                const rows = [];
 
-        // Sisanya sama seperti sebelumnya...
-        const docDefinition = {
-            pageSize: 'A5',
-            pageMargins: [20, 80, 20, 80],
+                for (let i = 0; i < fotoImages.length; i += fotoPerBaris) {
+                    const rowImages = fotoImages.slice(i, i + fotoPerBaris);
 
-            header: {
-                margin: [20, 20, 20, 10],
-                stack: [
-                    {
-                        columns: [
-                            {
-                                width: 'auto',
-                                image: tunasLogo,
-                                fit: [25, 25],
-                                margin: [0, 0, 8, 0]
-                            },
-                            {
-                                width: '*',
-                                stack: [
-                                    { text: 'Tunas Toyota Batutulis', fontSize: 14, bold: true, color: '#e60000' },
-                                    { text: 'Jl. Batutulis Raya No. 42, Jakarta Pusat', fontSize: 10 },
-                                    { text: 'Telp: (021) 3454465', fontSize: 9 }
-                                ],
-                                alignment: 'left'
-                            }
-                        ]
-                    },
-                    {
-                        margin: [0, 8, 0, 0],
-                        canvas: [
-                            { type: 'line', x1: 0, y1: 0, x2: 400, y2: 0, lineWidth: 1, color: '#e60000' }
-                        ]
+                    // masing-masing gambar proporsional
+                    const columns = rowImages.map(img => ({
+                        image: img,
+                        fit: [180, 145], // sedikit lebih besar agar memenuhi lebar halaman
+                        alignment: 'center',
+                        margin: [2, 0, 2, 0] // sedikit jarak antar gambar
+                    }));
+
+                    // jika jumlah gambar < 3, tambahkan kolom kosong agar tetap sejajar
+                    while (columns.length < fotoPerBaris) {
+                        columns.push({ text: '', width: '*' });
                     }
-                ]
-            },
 
-            footer: function (currentPage, pageCount) {
-                const advisorName = data.service_advisor || 'Abdul Azis';
-                const whatsappNum = getWhatsAppNumber(advisorName);
+                    rows.push({
+                        columns: columns,
+                        columnGap: 6, // jarak antar kolom kecil saja
+                        margin: [0, 0, 0, 6]
+                    });
+                }
 
-                return {
-                    margin: [20, 10, 20, 10],
+                content.push(...rows);
+                content.push({ text: '', margin: [0, 0, 0, 10] });
+            }
+
+            // Tambahkan keterangan dan footer notes
+            const notes = [
+                { text: '*Harga dapat berubah sewaktu-waktu tanpa pemberitahuan', fontSize: 8, italics: true, margin: [0, 0, 0, 2] },
+                { text: '*Ada (Dapat dilakukan penggantian), TAM (Order 3 hari), BO (Order 1 bulan), N/A (berhenti produksi)', fontSize: 8, italics: true, margin: [0, 0, 0, 2] }
+            ];
+
+            // Tambahan informasi tentang perhitungan harga
+            if (selectedSpareparts.length > 0) {
+                notes.push(
+                    {
+                        text: '*Item bergaris coret adalah komponen yang sudah disetujui dan tidak termasuk dalam total harga',
+                        fontSize: 8,
+                        italics: true,
+                        margin: [0, 0, 0, 2],
+                        color: '#e60000'
+                    }
+                );
+            }
+
+            notes.push({
+                text: `Keterangan: ${data.keterangan || 'Tidak ada keterangan tambahan'}`,
+                fontSize: 10,
+                margin: [0, 8, 0, 0]
+            });
+
+            content.push(...notes);
+
+            // PERBAIKAN GARIS HEADER - Hilangkan whitespace tidak seimbang
+            const docDefinition = {
+                pageSize: 'A5',
+                pageMargins: [20, 80, 20, 80],
+
+                header: {
+                    margin: [20, 20, 20, 10],
                     stack: [
                         {
                             columns: [
                                 {
-                                    width: '*',
-                                    stack: [
-                                        {
-                                            text: `Hubungi ${advisorName} untuk melakukan perbaikan:`,
-                                            bold: true,
-                                            fontSize: 10
-                                        },
-                                        {
-                                            margin: [0, 2, 0, 0],
-                                            columns: [
-                                                {
-                                                    width: 12,
-                                                    image: whatsappIcon,
-                                                    fit: [10, 10],
-                                                    margin: [0, 0, 6, 0]
-                                                },
-                                                {
-                                                    width: '*',
-                                                    text: whatsappNum,
-                                                    fontSize: 10,
-                                                    color: '#25D366'
-                                                }
-                                            ]
-                                        },
-                                        {
-                                            text: `Service Advisor Tunas Toyota Batutulis`,
-                                            fontSize: 8,
-                                            color: '#666',
-                                            margin: [0, 4, 0, 0]
-                                        }
-                                    ]
+                                    width: 'auto',
+                                    image: tunasLogo,
+                                    fit: [25, 25],
+                                    margin: [0, 0, 8, 0]
                                 },
                                 {
-                                    width: 60,
-                                    image: qrBase64,
-                                    fit: [50, 50]
+                                    width: '*',
+                                    stack: [
+                                        { text: 'Tunas Toyota Batutulis', fontSize: 14, bold: true, color: '#e60000' },
+                                        { text: 'Jl. Batutulis Raya No. 42, Jakarta Pusat', fontSize: 10 },
+                                        { text: 'Telp: (021) 3454465', fontSize: 9 }
+                                    ],
+                                    alignment: 'left'
                                 }
                             ]
                         },
                         {
-                            margin: [0, 5, 0, 0],
-                            columns: [
+                            margin: [0, 8, 0, 0],
+                            canvas: [
                                 {
-                                    width: '*',
-                                    text: `Dicetak pada: ${new Date().toLocaleDateString('id-ID')} ${new Date().toLocaleTimeString('id-ID')}`,
-                                    fontSize: 8,
-                                    color: '#6c757d',
-                                    alignment: 'left'
-                                },
-                                {
-                                    width: 50,
-                                    text: currentPage.toString() + ' / ' + pageCount,
-                                    fontSize: 8,
-                                    alignment: 'right'
+                                    type: 'line',
+                                    x1: 0,
+                                    y1: 0,
+                                    x2: 515, // SESUAIKAN DENGAN LEBAR HALAMAN A5
+                                    y2: 0,
+                                    lineWidth: 1,
+                                    color: '#e60000'
                                 }
                             ]
                         }
                     ]
-                };
-            },
+                },
 
-            content: content
-        };
+                footer: function (currentPage, pageCount) {
+                    const advisorName = data.service_advisor || 'Abdul Azis';
+                    const whatsappNum = getWhatsAppNumber(advisorName);
 
-        // Download PDF
-        pdfMake.createPdf(docDefinition).download(`estimasi_${data.nopol}_${new Date().getTime()}.pdf`);
+                    return {
+                        margin: [20, 10, 20, 10],
+                        stack: [
+                            {
+                                columns: [
+                                    {
+                                        width: '*',
+                                        stack: [
+                                            {
+                                                text: `Hubungi ${advisorName} untuk melakukan perbaikan:`,
+                                                bold: true,
+                                                fontSize: 10
+                                            },
+                                            {
+                                                margin: [0, 2, 0, 0],
+                                                columns: [
+                                                    {
+                                                        width: 12,
+                                                        image: whatsappIcon,
+                                                        fit: [10, 10],
+                                                        margin: [0, 0, 6, 0]
+                                                    },
+                                                    {
+                                                        width: '*',
+                                                        text: whatsappNum,
+                                                        fontSize: 10,
+                                                        color: '#25D366'
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                text: `Service Advisor Tunas Toyota Batutulis`,
+                                                fontSize: 8,
+                                                color: '#666',
+                                                margin: [0, 4, 0, 0]
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        width: 60,
+                                        image: qrBase64,
+                                        fit: [50, 50]
+                                    }
+                                ]
+                            },
+                            {
+                                margin: [0, 5, 0, 0],
+                                columns: [
+                                    {
+                                        width: '*',
+                                        text: `Dicetak pada: ${new Date().toLocaleDateString('id-ID')} ${new Date().toLocaleTimeString('id-ID')}`,
+                                        fontSize: 8,
+                                        color: '#6c757d',
+                                        alignment: 'left'
+                                    },
+                                    {
+                                        width: 50,
+                                        text: currentPage.toString() + ' / ' + pageCount,
+                                        fontSize: 8,
+                                        alignment: 'right'
+                                    }
+                                ]
+                            }
+                        ]
+                    };
+                },
 
-    } catch (error) {
-        console.error('Error generating PDF:', error);
-        alert('Terjadi kesalahan saat membuat PDF: ' + error.message);
+                content: content
+            };
+
+            // Download PDF
+            pdfMake.createPdf(docDefinition).download(`estimasi_${data.nopol}_${new Date().getTime()}.pdf`);
+
+        } catch (error) {
+            console.error('Error generating PDF:', error);
+            alert('Terjadi kesalahan saat membuat PDF: ' + error.message);
+        }
     }
-}
     //latest
     function formatRupiah(amount) {
         return 'Rp ' + parseInt(amount).toLocaleString('id-ID');
